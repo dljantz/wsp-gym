@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
 import math
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import torch
 import torch.nn as nn
@@ -70,6 +71,35 @@ def _gather_shifted_token_logprobs(
     return gathered[active_mask]
 
 
+def _snapshot_trainable_params(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Capture a frozen CPU snapshot of trainable parameters (e.g. loaded SFT LoRA weights)."""
+    return {
+        name: param.detach().cpu().clone()
+        for name, param in model.named_parameters()
+        if param.requires_grad
+    }
+
+
+@contextlib.contextmanager
+def _swap_trainable_params(
+    model: nn.Module,
+    ref_params: dict[str, torch.Tensor],
+) -> Iterator[None]:
+    """Temporarily swap trainable parameter tensors to a reference snapshot, restoring in finally."""
+    saved: dict[str, torch.Tensor] = {}
+    named = dict(model.named_parameters())
+    try:
+        for name, ref_tensor in ref_params.items():
+            param = named.get(name)
+            if param is not None:
+                saved[name] = param.data
+                param.data = ref_tensor.to(device=param.device, dtype=param.dtype)
+        yield
+    finally:
+        for name, orig_data in saved.items():
+            named[name].data = orig_data
+
+
 def _compute_reference_logprobs(
     policy_model: nn.Module,
     ref_model: nn.Module | None,
@@ -77,10 +107,14 @@ def _compute_reference_logprobs(
     attention_mask: torch.Tensor,
     labels: torch.Tensor,
     fallback: torch.Tensor,
+    ref_params: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     with torch.no_grad():
         if ref_model is not None:
             return _gather_shifted_token_logprobs(ref_model, input_ids, attention_mask, labels)
+        if ref_params:
+            with _swap_trainable_params(policy_model, ref_params):
+                return _gather_shifted_token_logprobs(policy_model, input_ids, attention_mask, labels)
         if hasattr(policy_model, "disable_adapter"):
             with policy_model.disable_adapter():
                 return _gather_shifted_token_logprobs(policy_model, input_ids, attention_mask, labels)
@@ -94,6 +128,7 @@ def compute_grpo_loss_and_metrics(
     clip_eps: float = 0.2,
     kl_beta: float = 0.02,
     accumulate_grads: bool = False,
+    ref_params: dict[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute clipped multi-turn GRPO surrogate loss + Schulman k3 KL penalty.
 
@@ -148,6 +183,7 @@ def compute_grpo_loss_and_metrics(
             attention_mask,
             labels,
             fallback=log_pi_theta,
+            ref_params=ref_params,
         )
         old_lp_raw = traj.get("old_token_logprobs")
         if old_lp_raw is None:
@@ -397,6 +433,7 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
         )
         policy_model = get_peft_model(base_model, lora_cfg)
 
+    sft_ref_params = _snapshot_trainable_params(policy_model)
     device = next(policy_model.parameters()).device
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=float(args.lr), weight_decay=0.01)
     scheduler = CurriculumScheduler(
@@ -479,6 +516,7 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                     clip_eps=float(args.clip_eps),
                     kl_beta=float(args.kl_beta),
                     accumulate_grads=True,
+                    ref_params=sft_ref_params,
                 )
                 torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
                 optimizer.step()
@@ -531,17 +569,17 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sft-adapter-path", default="checkpoints/sft_lora")
     parser.add_argument("--output-dir", default="checkpoints/grpo_lora")
     parser.add_argument("--log-path", default="trajectories/grpo_train_log.jsonl")
-    parser.add_argument("--group-size", type=int, default=8)
-    parser.add_argument("--num-steps", type=int, default=200)
+    parser.add_argument("--group-size", type=int, default=6)
+    parser.add_argument("--num-steps", type=int, default=80)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--kl-beta", type=float, default=0.02)
     parser.add_argument("--clip-eps", type=float, default=0.2)
-    parser.add_argument("--max-turns", type=int, default=6)
+    parser.add_argument("--max-turns", type=int, default=4)
     parser.add_argument("--max-length", type=int, default=4096)
-    parser.add_argument("--max-new-tokens", type=int, default=768)
+    parser.add_argument("--max-new-tokens", type=int, default=1280)
     parser.add_argument("--timeout-sec", type=float, default=DEFAULT_TURN_TIMEOUT_SEC)
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--save-every", type=int, default=25)
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--save-every", type=int, default=20)
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()

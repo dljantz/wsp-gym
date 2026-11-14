@@ -719,6 +719,8 @@ class TestWSPGym(unittest.TestCase):
         from eval import run_evaluation
         from train_grpo import (
             _snapshot_old_logprobs,
+            _snapshot_trainable_params,
+            _swap_trainable_params,
             compute_grpo_loss_and_metrics,
             run_grpo_dry_run,
         )
@@ -795,6 +797,31 @@ class TestWSPGym(unittest.TestCase):
         self.assertAlmostEqual(metrics_joint["loss"], metrics_acc["loss"], places=5)
         self.assertAlmostEqual(float(loss_joint.item()), float(loss_acc.item()), places=5)
         self.assertAlmostEqual(gn_joint, gn_acc, places=5)
+
+        # Verify ref_params KL anchor snapshot/swap: kl_div == 0 when matching, > 0 after step, params restored
+        m3 = copy.deepcopy(ref)
+        ref_snap = _snapshot_trainable_params(m3)
+        self.assertGreater(len(ref_snap), 0)
+        _, metrics_eq = compute_grpo_loss_and_metrics(m3, None, batch, ref_params=ref_snap)
+        self.assertAlmostEqual(metrics_eq["kl_div"], 0.0, places=6)
+
+        opt3 = torch.optim.SGD(m3.parameters(), lr=0.1)
+        opt3.zero_grad(set_to_none=True)
+        loss3, _ = compute_grpo_loss_and_metrics(m3, None, batch, ref_params=ref_snap)
+        loss3.backward()
+        opt3.step()
+
+        post_step_snap = _snapshot_trainable_params(m3)
+        _, metrics_shifted = compute_grpo_loss_and_metrics(m3, None, batch, ref_params=ref_snap)
+        self.assertGreater(metrics_shifted["kl_div"], 0.0)
+        for name, orig_val in post_step_snap.items():
+            self.assertTrue(torch.equal(dict(m3.named_parameters())[name].detach().cpu(), orig_val))
+
+        with _swap_trainable_params(m3, ref_snap):
+            for name, ref_val in ref_snap.items():
+                self.assertTrue(torch.equal(dict(m3.named_parameters())[name].detach().cpu(), ref_val))
+        for name, orig_val in post_step_snap.items():
+            self.assertTrue(torch.equal(dict(m3.named_parameters())[name].detach().cpu(), orig_val))
 
 
 if __name__ == "__main__":

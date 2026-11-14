@@ -62,7 +62,7 @@ def make_policy_fn(
     model_name_or_path: str | None = None,
     adapter_path: str | None = None,
     temperature: float = 0.0,
-    max_new_tokens: int = 1024,
+    max_new_tokens: int = 1536,
 ) -> Callable[[list[dict[str, str]]], str]:
     """Create a raw-text multi-turn policy callback for `dummy`, `scripted`, or `hf`."""
     if backend == "dummy":
@@ -153,7 +153,7 @@ def run_evaluation(
     model_name_or_path: str | None = None,
     adapter_path: str | None = None,
     temperature: float = 0.0,
-    max_new_tokens: int = 1024,
+    max_new_tokens: int = 1536,
     out_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Run held-out evaluation across all 17 subtypes and aggregate metrics."""
@@ -264,7 +264,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name-or-path", default=None)
     parser.add_argument("--adapter-path", default=None)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--max-new-tokens", type=int, default=1536)
     parser.add_argument("--out-path", default=None)
     return parser.parse_args()
 
