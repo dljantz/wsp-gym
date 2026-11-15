@@ -27,7 +27,7 @@
 | Phase | Status | Environment & Budget | Core Objective |
 | :--- | :--- | :--- | :--- |
 | **Phase 0: Gym, Playtesting & Cold-Start Data** | **COMPLETE** (Cycles 1–3 + Scaling Harness Built; `13/13` Unit Tests Passing) | Windows Laptop (`python 3.14`, CPU PyTorch, **\$0**) | Built & hardened the 7-category procedural gym (`wsp_gym`), completed 7/7 Level 1.5 grokked `RMSNorm`+`SwiGLU`+`RoPE` models, built `training.py` SFT/GRPO harness & `scaler.py` automated blinded rollout engine, and validated end-to-end 17-subtype coverage. |
-| **Phase 1: Local Neurosurgeon Training (Level 1 + 1.5)** | **Local Prep (Steps L1–L4) COMPLETE** — Ready for Cloud GPU (`C1–C4`) | Local CPU Prep (**\$0**) -> Cloud GPU (**~\$100**, ~40 H100 hrs) | **Local Prep Complete:** Enforced symptom-only prompt blinding (`L1`), sandbox timeout/parser/reward-shaping hardening (`L2`), curated **123-episode Option 3 turn-masked SFT corpus** (`L3`), and built/verified `eval.py`, `train_sft.py`, `train_grpo.py` (`L4`). **Next (`C1–C4`):** Train a 4B–8B open-weights model (`Qwen`/`DeepSeek`/`Gemma`) via turn-masked LoRA SFT warmup followed by online multi-turn GRPO across procedural challenges. |
+| **Phase 1: Local Neurosurgeon Training (Level 1 + 1.5)** | **Cloud Run 1 (`C1–C4`) COMPLETE** (`0% -> 44.12%` SFT; `72.2%` Steps 18–29 GRPO; `32.35%` Step 80) | Local CPU Prep (**\$0**) -> Cloud GPU (`1x H100 80GB`) | **Completed:** Enforced symptom-only prompt blinding (`L1`), sandbox timeout/parser/reward-shaping hardening (`L2`), curated **123-episode Option 3 turn-masked SFT corpus** (`L3`), verified `eval.py`/`train_sft.py`/`train_grpo.py` (`L4`), and ran Cloud GPU `Steps C1–C4` on `Qwen/Qwen2.5-Coder-7B-Instruct` (`trajectories/eval_{base,sft,grpo}.json`, `checkpoints/{sft,grpo}_lora`). **Next:** Evaluate intermediate `step_0020`/`step_0040` GRPO checkpoints, harden multi-subtype mixing (with all-fail micro-shaping guard now active), and close `cat3`/`cat4`/`cat6` gaps before Phase 2. |
 | **Phase 2: Scale-Transfer Evaluation (Level 2)** | Planned | Cloud GPU (**~\$100**) | Evaluate whether the Python neurosurgery strategies learned on $d=32\text{--}64$ transformers generalize zero-shot or with light RL to $100\text{M}\text{--}1\text{B}$ target networks. |
 | **Phase 3: Self-Surgery Proof-of-Concept (Level 3)** | Planned | Cloud GPU (**~\$100**) | Have the RL-trained 4B–8B model inspect and surgically edit a cloned copy of **its own 4B–8B weights** (e.g., curing an induced repetition loop, excising a planted backdoor, or injecting a null-space skill) under an **Immutable Twin** verifier. |
 
@@ -189,22 +189,46 @@ python train_grpo.py --dry-run
 4. **Cat 5 Level 1.5 Coprime & Readout-Margin Calibration (`generate_level1_5_cat5_unlearn_excise`):** When testing excisions against a 10-step `(W_U, b_U)` gradient recovery attack on a mixed clean/triggered batch, sampling `a0` coprime to `m_mod=20` prevents clean-label collapse, and using a high clean `W_out`/`W_U` readout margin (`12.0` / `16.0`) relative to the constant `carrier=8.0` dimension prevents `Adam` from exploiting constant RMSNorm features to overpredict `c_bad` even on clean oracle weights.
 5. **Cat 7 Level 1.5 Cancelling SwiGLU Carrier Cancellation Precision (`generate_level1_5_cat7_refactor`):** When sampling cancelling `(j, j+1)` SwiGLU decoy pairs under a strong constant `carrier=8.0` (`dim 3`), allowing large random weights on the carrier dimension creates `~8000` hidden activations (`~64,000` `W_out` contributions) whose IEEE-754 float32 accumulation error after `scramble_gauge` neuron rescaling exceeds the `1e-3` equivalence tolerance on some seeds (`1186`, `1203`). Zeroing `wg[3]` and `wi[3]` on the cancelling decoy pairs preserves full decoy norms across the remaining dims while keeping `max_abs_logit_diff < 1e-3`.
 
+### Phase 1 Cloud GPU Run 1 Results (`Steps C1–C4` on `1x H100 80GB`) — COMPLETE
+Executed end-to-end training and held-out 17-subtype evaluation (`34` episodes, `seeds >= 9000`, `20` strictly zero-probe `B=0`) on `Qwen/Qwen2.5-Coder-7B-Instruct`:
+
+| Metric / Category | C1: Base (`eval_base.json`) | C2: LoRA SFT (`eval_sft.json`) | C4: 80-Step GRPO (`eval_grpo.json`) |
+| :--- | :---: | :---: | :---: |
+| **Overall Pass Rate (`34` eps)** | `0.00%` (`0/34`) | **`44.12%` (`15/34`)** | `32.35%` (`11/34`) |
+| **Zero-Probe `B=0` Pass Rate (`20` eps)** | `0.00%` (`0/20`) | **`45.00%` (`9/20`)** | `25.00%` (`5/20`) |
+| **Mean Verifier Base Reward** | `0.000086` | **`0.408786`** | `0.173251` |
+| **Format Compliance (`mean_format_rate`)** | `34.12%` | **`98.04%`** | `92.65%` |
+| **`cat1_decompile` (`6` eps)** | `0.0%` | **`66.7%` (`4/6`)** | `0.0%` |
+| **`cat2_repair` (`6` eps)** | `0.0%` | **`83.3%` (`5/6`)** | **`83.3%` (`5/6`)** |
+| **`cat3_synthesize` / `cat4_nullspace_inject`** | `0.0%` / `0.0%` | `0.0%` / `0.0%` | `0.0%` / `0.0%` |
+| **`cat5_unlearn_excise` (`4` eps)** | `0.0%` | `50.0%` (`2/4` L1.5) | `50.0%` (`2/4` L1 `2tok`) |
+| **`cat6_splice_merge` (`6` eps)** | `0.0%` (`R=0.115`) | `0.0%` (`R=0.128`) | `0.0%` (`R=0.147`) |
+| **`cat7_refactor` (`4` eps)** | `0.0%` (`R=0.800`) | **`100.0%` (`4/4`)** | **`100.0%` (`4/4`)** |
+
+* **SFT Reference KL Anchor Validated:** Snapshotting frozen SFT LoRA parameters (`_snapshot_trainable_params` / `_swap_trainable_params` in [train_grpo.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/train_grpo.py)) anchored `kl_div` to **`0.00043`** at Step 0 and **`0.002–0.015`** through Step 30 (vs. `1.16–4.05` when erroneously disabling the SFT adapter).
+* **Peak RLVR Acquisition (`Steps 0–30`, `checkpoints/grpo_lora/step_0020`):**
+  * `orthogonal_subspace_model_merge` (`cat6_splice_merge`) climbed from `0%` (SFT) to **`100%`** (`6/6` passes on Steps 8, 10, 11; `66.7%` on Steps 26, 27).
+  * `2tok_backdoor_excision` (`cat5_unlearn_excise`) climbed from `0%` (SFT) to `50%–83.3%` in training (Steps 12, 21, 22, 24, 29) and **`100.0%` (`2/2`)** on held-out [trajectories/eval_grpo.json](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/eval_grpo.json).
+  * Steps `18–29` achieved a **`72.2%` rolling pass rate** across `72` online rollouts.
+* **Two Crucial RLVR Failure Modes Identified & Guarded:**
+  1. **All-Fail Micro-Shaping Drift (`Steps 49–79`):** On unsolved tasks where every rollout in a group scored identical base verifier reward (`cat3`/`cat4` or all `-1.0` on `cat1`), normalizing tiny `0.02–0.05` micro-shaping bonuses created full $\pm 1$ advantages, driving `kl_div` up to `0.387683` (Step 62) and causing `cat1_decompile` to regress (`66.7% -> 0%`) by `step_0080`. Added an all-fail guard in [train_grpo.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/train_grpo.py) (`max(base_rewards) - min(base_rewards) < 1e-4` skips the update when `step_idx >= 10`).
+  2. **Stage-0 Curriculum Lock-In:** Requiring `85%` rolling pass rate across all 7 categories kept `curriculum_stage=0` for all 80 steps, so specializing on Level 1 `2tok_backdoor_excision` (`0% -> 100%`) overwrote `level1_5_grokked_backdoor_excision` (`100% -> 0%`).
+
 ---
 
 ## 6. Where We're Going: Immediate Next Steps & Long-Term Horizon
 
-### Immediate Next Step: Cloud GPU Phase 1 Training (`Steps C1–C4`)
-All local CPU preparation (**Steps L1–L4**) is complete (`13/13` tests passing; [trajectories/sft_train.jsonl](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/sft_train.jsonl) curated to 123 high-entropy turn-masked trajectories; [eval.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/eval.py), [train_sft.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/train_sft.py), and [train_grpo.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/train_grpo.py) verified end-to-end).
+### Immediate Next Step: Evaluate `step_0020`/`step_0040` & Run Follow-Up Phase 1 Tuning
+Phase 1 Cloud Run 1 (`C1–C4`) artifacts are saved locally ([checkpoints/sft_lora](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/checkpoints/sft_lora), [checkpoints/grpo_lora](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/checkpoints/grpo_lora), [trajectories/eval_base.json](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/eval_base.json), [trajectories/eval_sft.json](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/eval_sft.json), [trajectories/eval_grpo.json](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/eval_grpo.json), [trajectories/grpo_train_log.jsonl](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/grpo_train_log.jsonl)).
 
-* **Cloud GPU Execution Sequence (`1x A100/H100 80GB` recommended; `transformers`, `peft`, `accelerate`):**
-  1. **Step C1 (Base Zero-Shot Evaluation):** Run `python eval.py --backend hf --model-name-or-path Qwen/Qwen2.5-Coder-7B-Instruct --out-path trajectories/eval_base.json` to measure pre-training baseline pass rate and formatting compliance across the 34 held-out episodes (`seeds >= 9000`).
-  2. **Step C2 (Turn-Masked LoRA SFT Warmup + Checkpoint Eval):** Run `python train_sft.py --model-name-or-path Qwen/Qwen2.5-Coder-7B-Instruct --output-dir checkpoints/sft_lora` (`r=32`, `epochs=3`), then evaluate `checkpoints/sft_lora` via `eval.py --out-path trajectories/eval_sft.json`.
-  3. **Step C3 (Online Multi-Turn GRPO + Curriculum Annealing):** Run `python train_grpo.py --model-name-or-path Qwen/Qwen2.5-Coder-7B-Instruct --sft-adapter-path checkpoints/sft_lora --output-dir checkpoints/grpo_lora` backed by `GRPORolloutEnv` + `CurriculumScheduler` (`B -> 0` probe annealing across held-out procedural seeds and all 17 subtypes).
-  4. **Step C4 (Post-GRPO Held-Out Benchmark & Error Analysis):** Evaluate `checkpoints/grpo_lora` via `eval.py --out-path trajectories/eval_grpo.json` (`base -> sft -> grpo` pass rate, zero-probe pass rate, and per-subtype curves) to confirm Phase 1 mastery before Phase 2 scaling.
+* **Recommended Follow-Up Actions before Phase 2:**
+  1. Benchmark `checkpoints/grpo_lora/step_0020` and `checkpoints/grpo_lora/step_0040` via `eval.py` to quantify peak pre-drift GRPO performance (captured near the `72.2%` Steps 18–29 rolling window).
+  2. Add mixed Level 1 + Level 1.5 sampling inside `CurriculumScheduler` Stage 0 (or lower stage-advancement coupling) alongside the new all-fail micro-shaping guard in [train_grpo.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/train_grpo.py).
+  3. Expand SFT/GRPO coverage on `cat3_synthesize`, `cat4_nullspace_inject`, and `cat6_splice_merge` (longer multi-step linear algebra synthesis & Procrustes composition).
 
 ### Long-Term Research Milestones (Phases 1–3)
-* **Phase 1 (LoRA SFT + GRPO on 4B–8B Local Architect — Cloud GPU `C1–C4` Ready):**
-  * Cold-start LoRA SFT on the 123-episode Option 3 turn-masked dataset, followed by online multi-turn GRPO over `wsp_gym.verifier.verify_submission` + micro-shaping rewards while annealing `forward_budget` toward `0`.
+* **Phase 1 (LoRA SFT + GRPO on 4B–8B Local Architect — Cloud Run 1 Complete; Follow-Up Tuning Next):**
+  * Cold-start LoRA SFT on the 123-episode Option 3 turn-masked dataset (`44.12%` pass rate, `45.0%` zero-probe), followed by online multi-turn GRPO over `wsp_gym.verifier.verify_submission` while annealing `forward_budget` toward `0`.
 * **Phase 2 (Level 2 Scale Transfer):**
   * Benchmark whether scale-invariant `wsp_tools` workflows (SVD subspace localization, RoPE offset profiling, RMSNorm absorption, null-space projection checks) transfer to $100\text{M}\text{--}1\text{B}$ transformers (`Qwen`/`Llama`-style blocks) with minimal or zero retraining.
 * **Phase 3 (Level 3 Immutable-Twin Self-Surgery):**

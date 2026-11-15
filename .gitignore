@@ -4,4 +4,6 @@ __pycache__/
 venv/
 checkpoints/
 challenges/
+phase1_results*
+*.tar.gz
 *.pt

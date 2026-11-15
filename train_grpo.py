@@ -476,6 +476,7 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
             bundle = scheduler.sample_challenge()
             rollout_records: list[dict[str, Any]] = []
             rewards: list[float] = []
+            base_rewards: list[float] = []
             pass_flags: list[bool] = []
 
             for _g in range(int(args.group_size)):
@@ -487,6 +488,7 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                 base_r = float(ver.get("total_reward", -1.0))
 
                 rewards.append(shaped_r)
+                base_rewards.append(base_r)
                 pass_flags.append(passed)
                 scheduler.record_outcome(passed, base_r)
 
@@ -502,6 +504,8 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                 )
 
             adv_info = compute_grpo_group_advantages(rewards)
+            if step_idx >= 10 and base_rewards and (max(base_rewards) - min(base_rewards)) < 1e-4:
+                adv_info["effective_group"] = False
             for rec, adv in zip(rollout_records, adv_info["advantages"]):
                 rec["advantage"] = float(adv)
 

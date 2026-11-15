@@ -1,0 +1,140 @@
+{
+  "backend": "hf",
+  "base_seed": 9000,
+  "episodes_per_subtype": 2,
+  "total_episodes": 34,
+  "passed_count": 11,
+  "pass_rate": 0.323529,
+  "zero_probe_episodes": 20,
+  "zero_probe_pass_rate": 0.25,
+  "mean_base_reward": 0.173251,
+  "mean_shaped_reward": 0.197604,
+  "mean_turns": 4.6765,
+  "mean_format_rate": 0.926471,
+  "mean_clean_exec_rate": 0.341176,
+  "explicit_submit_rate": 0.352941,
+  "by_category": {
+    "cat1_decompile": {
+      "count": 6,
+      "pass_rate": 0.0,
+      "mean_reward": -1.0
+    },
+    "cat2_repair": {
+      "count": 6,
+      "pass_rate": 0.833333,
+      "mean_reward": 0.810709
+    },
+    "cat3_synthesize": {
+      "count": 4,
+      "pass_rate": 0.0,
+      "mean_reward": 0.032129
+    },
+    "cat4_nullspace_inject": {
+      "count": 4,
+      "pass_rate": 0.0,
+      "mean_reward": 0.028711
+    },
+    "cat5_unlearn_excise": {
+      "count": 4,
+      "pass_rate": 0.5,
+      "mean_reward": 0.504184
+    },
+    "cat6_splice_merge": {
+      "count": 6,
+      "pass_rate": 0.0,
+      "mean_reward": 0.146517
+    },
+    "cat7_refactor": {
+      "count": 4,
+      "pass_rate": 1.0,
+      "mean_reward": 0.971773
+    }
+  },
+  "by_subtype": {
+    "2tok_backdoor_excision": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.916082
+    },
+    "dual_offset_modular_shift": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": 0.035547
+    },
+    "level1_5_grokked_backdoor_excision": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": 0.092285
+    },
+    "level1_5_grokked_rope_decompile": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": -1.0
+    },
+    "level1_5_grokked_rope_merge": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": 0.195508
+    },
+    "level1_5_grokked_subspace_inject": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": 0.032812
+    },
+    "level1_5_grokked_svd_defrag": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.98563
+    },
+    "level1_5_grokked_swiglu_rope_repair": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.987535
+    },
+    "level1_5_swiglu_rope_synthesize": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": 0.02871
+    },
+    "mlp_sink_attractor": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.945608
+    },
+    "modular_linear_with_3tok_trojan": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": -1.0
+    },
+    "modular_varied_lag_with_3tok_trojan": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": -1.0
+    },
+    "norm_matched_k_composition_corruption": {
+      "count": 2,
+      "pass_rate": 0.5,
+      "mean_reward": 0.498984
+    },
+    "nullspace_and_cancelling_head_defrag": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.957915
+    },
+    "orthogonal_subspace_model_merge": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": 0.236523
+    },
+    "orthogonal_subspace_skill_addition": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": 0.024609
+    },
+    "vertical_function_composition": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": 0.00752
+    }
+  }
+}
