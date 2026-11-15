@@ -157,15 +157,15 @@ def audit_and_export_sft_dataset(
 
 
 class CurriculumScheduler:
-    """Curriculum sampler that progresses from Level 1 to Cycle 2/Level 1.5 and anneals probes B -> 0."""
+    """Curriculum sampler with stratified 17-subtype passes and B -> 0 probe annealing."""
 
     def __init__(
         self,
         seed: int = 0,
         initial_stage: int = 0,
         window_size: int = 8,
-        advance_pass_rate: float = 0.85,
-        advance_reward: float = 0.85,
+        advance_pass_rate: float = 0.70,
+        advance_reward: float = 0.65,
     ) -> None:
         self.rng = random.Random(seed)
         self.stage = int(max(0, min(3, initial_stage)))
@@ -173,6 +173,7 @@ class CurriculumScheduler:
         self.advance_pass_rate = float(advance_pass_rate)
         self.advance_reward = float(advance_reward)
         self._history: deque[tuple[bool, float]] = deque(maxlen=self.window_size)
+        self._subtype_deck: list[tuple[str, str]] = []
         self._counter = 0
 
     def record_outcome(self, passed: bool, total_reward: float) -> bool:
@@ -188,40 +189,58 @@ class CurriculumScheduler:
             return True
         return False
 
-    def _pick_subtype(self, cat: str) -> str | None:
-        if self.stage == 0:
-            if cat == "cat1_decompile":
-                return "modular_linear_with_3tok_trojan"
-            if cat == "cat2_repair":
-                return "mlp_sink_attractor"
-            if cat == "cat6_splice_merge":
-                return "orthogonal_subspace_model_merge"
-            return None
+    def _next_stratified_pair(self) -> tuple[str, str]:
+        if not self._subtype_deck:
+            self._subtype_deck = [
+                (cat, sub)
+                for cat in CATEGORIES
+                for sub in CYCLE2_SUBTYPE_CHOICES[cat]
+            ]
+            self.rng.shuffle(self._subtype_deck)
+        return self._subtype_deck.pop()
+
+    def _pick_subtype(self, cat: str) -> str:
         return self.rng.choice(CYCLE2_SUBTYPE_CHOICES[cat])
 
     def sample_challenge(
         self,
         seed: int | None = None,
         category: str | None = None,
+        subtype: str | None = None,
     ) -> ChallengeBundle:
         """Sample a ChallengeBundle tuned to the current curriculum stage and probe budget."""
         ep_seed = self._counter if seed is None else int(seed)
         self._counter += 1
-        cat = self.rng.choice(CATEGORIES) if category is None else category
-        subtype = self._pick_subtype(cat)
-        difficulty = 1.0 if self.stage == 0 else 1.5
+        if category is None and subtype is None:
+            cat, chosen_subtype = self._next_stratified_pair()
+        else:
+            cat = self.rng.choice(CATEGORIES) if category is None else category
+            chosen_subtype = self._pick_subtype(cat) if subtype is None else subtype
+
+        hard_only = (
+            "level1_5" in chosen_subtype
+            or chosen_subtype
+            in (
+                "modular_varied_lag_with_3tok_trojan",
+                "norm_matched_k_composition_corruption",
+                "dual_offset_modular_shift",
+            )
+        )
+        difficulty = 1.5 if (self.stage >= 1 or hard_only) else 1.0
 
         if self.stage >= 3:
             budget: int | None = 0
         else:
-            probe_bundle = generate_challenge(cat, seed=ep_seed, difficulty=difficulty, subtype=subtype)
+            probe_bundle = generate_challenge(
+                cat, seed=ep_seed, difficulty=difficulty, subtype=chosen_subtype
+            )
             if self.stage == 2 and probe_bundle.forward_budget > 0:
                 budget = max(1, probe_bundle.forward_budget // 2)
             else:
                 return probe_bundle
 
         return generate_challenge(
-            cat, seed=ep_seed, difficulty=difficulty, forward_budget=budget, subtype=subtype
+            cat, seed=ep_seed, difficulty=difficulty, forward_budget=budget, subtype=chosen_subtype
         )
 
 

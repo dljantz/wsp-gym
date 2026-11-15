@@ -331,6 +331,8 @@ def verify_submission(
         s_surgical = max(0.0, 1.0 - 0.5 * (frob_ratio + l0_ratio))
         passed = bool(equiv_ok and compression_ok)
         reward = _compute_unified_reward(s_task, 0.0 if equiv_ok else max_diff, s_surgical, stats)
+        if frob_ratio >= 0.95 and l0_ratio >= 0.95 and not passed:
+            reward = min(reward, 0.0)
         return {
             "passed": passed,
             "total_reward": round(reward, 6),

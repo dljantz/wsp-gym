@@ -178,6 +178,7 @@ def run_evaluation(
         format_rates: list[float] = []
         clean_exec_rates: list[float] = []
         explicit_submits: list[float] = []
+        episode_records: list[dict[str, Any]] = []
         passed_count = 0
 
         for bundle in suite:
@@ -207,6 +208,22 @@ def run_evaluation(
 
             cat_stats[bundle.category].append((passed, base_reward))
             sub_stats[bundle.subtype].append((passed, base_reward))
+            episode_records.append(
+                {
+                    "episode_id": bundle.episode_id,
+                    "category": bundle.category,
+                    "subtype": bundle.subtype,
+                    "forward_budget": int(bundle.forward_budget),
+                    "passed": passed,
+                    "base_reward": round(base_reward, 6),
+                    "shaped_reward": round(shaped_reward, 6),
+                    "turns": turns_used,
+                    "explicit_submit": bool(shaping.get("explicit_submit", 0.0)),
+                    "format_rate": float(shaping.get("format_rate", 0.0)),
+                    "clean_exec_rate": float(shaping.get("clean_exec_rate", 0.0)),
+                    "error": ver.get("error"),
+                }
+            )
 
         total = len(suite)
         report = {
@@ -244,6 +261,7 @@ def run_evaluation(
                 }
                 for sub, vals in sorted(sub_stats.items())
             },
+            "episodes": episode_records,
         }
         if out_path is not None:
             dst = Path(out_path)

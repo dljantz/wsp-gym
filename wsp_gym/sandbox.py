@@ -33,7 +33,7 @@ SYSTEM_PROMPT = (
     "Analyze and surgically modify neural network weights using linear algebra (PyTorch, NumPy, SciPy) "
     "within your forward-pass and turn budgets.\n\n"
     "Pre-loaded variables & helpers:\n"
-    "- `config`: ModelConfig dict; `weights`: editable state_dict; `orig_weights`: read-only clone; `weights_B` (Cat 6 only).\n"
+    "- `config`: ModelConfig dict; `brief_md`: task brief string; `weights`: editable state_dict; `orig_weights`: read-only clone; `weights_B` (Cat 6 only).\n"
     "- `probe_forward(input_ids, custom_weights=None, return_cache=True)`: consumes 1 forward batch (max batch=32). "
     "Returns `(logits, cache)` when `return_cache=True`, or `logits` tensor alone when `return_cache=False`.\n"
     "- `submit_weights(candidate_weights)`: queues `candidate_weights` dict for verification and ends the episode.\n"
@@ -279,6 +279,7 @@ class SandboxSession:
             "scipy": scipy,
             "wsp_tools": wsp_tools,
             "config": self.config.to_dict(),
+            "brief_md": self.brief_md,
             "weights": self.state["weights"],
             "orig_weights": {k: v.clone() for k, v in self.state["orig_weights"].items()},
             "probe_forward": probe_forward,

@@ -86,6 +86,12 @@ class TestWSPGym(unittest.TestCase):
                     base_res["passed"],
                     f"Baseline unexpectedly passed for {cat}: {base_res}",
                 )
+                if cat == "cat7_refactor":
+                    self.assertLessEqual(
+                        base_res["total_reward"],
+                        0.0,
+                        f"Uncompressed Cat 7 baseline reward should be <= 0.0: {base_res}",
+                    )
 
                 # 2. Cat 5 shallow masking cheat must fail
                 if cat == "cat5_unlearn_excise":
@@ -474,7 +480,11 @@ class TestWSPGym(unittest.TestCase):
             self.assertEqual(summary["zero_probe_count"], 1)
             self.assertTrue(sft_out.exists())
 
-        # 2. CurriculumScheduler stage progression and B -> 0 annealing
+        # 2. CurriculumScheduler stage progression, stratified 17-subtype sampling, and B -> 0 annealing
+        strat_sched = CurriculumScheduler(seed=11, initial_stage=0, window_size=8)
+        strat_bundles = [strat_sched.sample_challenge() for _ in range(17)]
+        self.assertEqual(len({b.subtype for b in strat_bundles}), 17)
+
         sched = CurriculumScheduler(seed=7, initial_stage=0, window_size=4)
         self.assertEqual(sched.stage, 0)
         for _ in range(4):
@@ -721,6 +731,7 @@ class TestWSPGym(unittest.TestCase):
             _snapshot_old_logprobs,
             _snapshot_trainable_params,
             _swap_trainable_params,
+            compute_grpo_group_advantages,
             compute_grpo_loss_and_metrics,
             run_grpo_dry_run,
         )
@@ -736,10 +747,12 @@ class TestWSPGym(unittest.TestCase):
 
         dummy_report = run_evaluation(backend="dummy", episodes_per_subtype=1, base_seed=9000)
         self.assertEqual(dummy_report["total_episodes"], 17)
+        self.assertEqual(len(dummy_report["episodes"]), 17)
         self.assertLess(dummy_report["pass_rate"], 0.25)
 
         scripted_report = run_evaluation(backend="scripted", episodes_per_subtype=1, base_seed=9000)
         self.assertEqual(scripted_report["total_episodes"], 17)
+        self.assertEqual(len(scripted_report["episodes"]), 17)
         self.assertEqual(scripted_report["pass_rate"], 1.0)
         self.assertGreaterEqual(scripted_report["mean_base_reward"], 0.85)
         self.assertEqual(scripted_report["mean_format_rate"], 1.0)
@@ -751,6 +764,47 @@ class TestWSPGym(unittest.TestCase):
         self.assertTrue(sft_summary["gradient_checkpointing"])
         self.assertEqual(sft_summary["effective_batch_size"], 32)
         self.assertGreater(sft_summary["grad_norm"], 0.0)
+
+        sft_rows = [
+            json.loads(line)
+            for line in Path("trajectories/sft_train.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(len(sft_rows), 123)
+        for row in sft_rows:
+            for msg in row["messages"]:
+                if msg.get("role") == "assistant":
+                    self.assertLessEqual(
+                        len(msg["content"]),
+                        2000,
+                        msg=f"Assistant message too long in {row['episode_id']} ({row['subtype']})",
+                    )
+                    self.assertNotIn(
+                        "brief_text =",
+                        msg["content"],
+                        msg=f"Embedded brief_text literal found in {row['episode_id']}",
+                    )
+
+        tied_adv = compute_grpo_group_advantages(
+            [-0.98, -0.95, -1.02, -1.00],
+            base_rewards=[-1.0, -1.0, -1.0, -1.0],
+        )
+        self.assertFalse(tied_adv["effective_group"])
+        self.assertEqual(tied_adv["advantages"], [0.0, 0.0, 0.0, 0.0])
+
+        noop_adv = compute_grpo_group_advantages(
+            [-0.95, -0.95, 0.085, 0.225],
+            base_rewards=[-1.0, -1.0, 0.035, 0.175],
+        )
+        self.assertFalse(noop_adv["effective_group"])
+        self.assertEqual(noop_adv["advantages"], [0.0, 0.0, 0.0, 0.0])
+
+        partial_adv = compute_grpo_group_advantages(
+            [-0.95, 0.45, 0.05, -0.95],
+            base_rewards=[-1.0, 0.35, 0.0, -1.0],
+        )
+        self.assertTrue(partial_adv["effective_group"])
+        self.assertGreater(max(partial_adv["advantages"]), 1.0)
 
         grpo_summary = run_grpo_dry_run(group_size=4, num_steps=2)
         self.assertEqual(grpo_summary["steps_completed"], 2)

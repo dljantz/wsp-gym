@@ -30,13 +30,26 @@ from wsp_gym.training import CurriculumScheduler, GRPORolloutEnv, compute_shaped
 def compute_grpo_group_advantages(
     rewards: list[float],
     eps: float = 1e-6,
+    base_rewards: list[float] | None = None,
+    min_base_span: float = 1e-4,
+    min_best_base_reward: float = 0.30,
 ) -> dict[str, Any]:
-    """Compute group-relative normalized advantages with zero-variance protection."""
+    """Compute group-relative normalized advantages with base-reward and zero-variance guards."""
     if not rewards:
         raise ValueError("rewards list must be non-empty.")
     mean_r = sum(float(r) for r in rewards) / len(rewards)
     var_r = sum((float(r) - mean_r) ** 2 for r in rewards) / len(rewards)
     std_r = math.sqrt(var_r)
+    if base_rewards is not None and len(base_rewards) > 0:
+        best_base = max(float(b) for b in base_rewards)
+        base_span = best_base - min(float(b) for b in base_rewards)
+        if base_span < float(min_base_span) or best_base < float(min_best_base_reward):
+            return {
+                "mean_reward": round(mean_r, 6),
+                "std_reward": round(std_r, 6),
+                "advantages": [0.0 for _ in rewards],
+                "effective_group": False,
+            }
     if std_r < eps:
         return {
             "mean_reward": round(mean_r, 6),
@@ -334,6 +347,7 @@ def run_grpo_dry_run(
             bundle = scheduler.sample_challenge()
             rollout_records: list[dict[str, Any]] = []
             rewards: list[float] = []
+            base_rewards: list[float] = []
 
             for g in range(int(group_size)):
                 policy_fn = _make_dry_run_rollout_policy(env, g, int(group_size))
@@ -341,13 +355,15 @@ def run_grpo_dry_run(
                 ver = res.get("verification") or {}
                 shaping = res.get("shaping") or compute_shaped_reward(ver, env._turn_stats)
                 shaped_r = float(shaping["shaped_reward"])
+                base_r = float(ver.get("total_reward", -1.0))
                 rewards.append(shaped_r)
+                base_rewards.append(base_r)
                 all_shaped.append(shaped_r)
                 total_rollouts += 1
 
                 scheduler.record_outcome(
                     bool(ver.get("passed", False)),
-                    float(ver.get("total_reward", -1.0)),
+                    base_r,
                 )
                 tok = tokenize_and_mask_chat(res["messages"], tokenizer, max_length=4096)
                 old_lp = _snapshot_old_logprobs(policy_model, tok)
@@ -360,7 +376,7 @@ def run_grpo_dry_run(
                     }
                 )
 
-            adv_info = compute_grpo_group_advantages(rewards)
+            adv_info = compute_grpo_group_advantages(rewards, base_rewards=base_rewards)
             adv_stds.append(float(adv_info["std_reward"]))
             for rec, adv in zip(rollout_records, adv_info["advantages"]):
                 rec["advantage"] = float(adv)
@@ -446,6 +462,9 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
     log_path = Path(args.log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     steps_logged: list[dict[str, Any]] = []
+    best_score: tuple[float, float] = (-1.0, -float("inf"))
+    best_step: int | None = None
+    best_ckpt_dir = Path(args.output_dir) / "best"
 
     def _sample_policy(messages: list[dict[str, str]]) -> str:
         policy_model.eval()
@@ -503,9 +522,7 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                     }
                 )
 
-            adv_info = compute_grpo_group_advantages(rewards)
-            if step_idx >= 10 and base_rewards and (max(base_rewards) - min(base_rewards)) < 1e-4:
-                adv_info["effective_group"] = False
+            adv_info = compute_grpo_group_advantages(rewards, base_rewards=base_rewards)
             for rec, adv in zip(rollout_records, adv_info["advantages"]):
                 rec["advantage"] = float(adv)
 
@@ -525,6 +542,7 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                 torch.nn.utils.clip_grad_norm_(policy_model.parameters(), 1.0)
                 optimizer.step()
 
+            mean_base_r = round(sum(base_rewards) / max(1, len(base_rewards)), 6)
             log_row = {
                 "step": step_idx,
                 "episode_id": bundle.episode_id,
@@ -532,6 +550,7 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                 "subtype": bundle.subtype,
                 "curriculum_stage": int(scheduler.stage),
                 "pass_rate": round(sum(1 for p in pass_flags if p) / max(1, len(pass_flags)), 4),
+                "mean_base_reward": mean_base_r,
                 "mean_reward": adv_info["mean_reward"],
                 "std_reward": adv_info["std_reward"],
                 "effective_group": bool(adv_info["effective_group"]),
@@ -540,6 +559,18 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
             steps_logged.append(log_row)
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(log_row) + "\n")
+
+            if len(steps_logged) >= 17:
+                recent = steps_logged[-17:]
+                rolling_pass = sum(float(r["pass_rate"]) for r in recent) / 17.0
+                rolling_base = sum(float(r["mean_base_reward"]) for r in recent) / 17.0
+                candidate_score = (round(rolling_pass, 6), round(rolling_base, 6))
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_step = step_idx + 1
+                    best_ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    policy_model.save_pretrained(best_ckpt_dir)
+                    tokenizer.save_pretrained(best_ckpt_dir)
 
             save_every = int(getattr(args, "save_every", 25))
             if save_every > 0 and (step_idx + 1) % save_every == 0:
@@ -562,6 +593,8 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
         "mean_reward": round(
             sum(r["mean_reward"] for r in steps_logged) / max(1, len(steps_logged)), 6
         ),
+        "best_step": best_step,
+        "best_checkpoint_dir": str(best_ckpt_dir) if best_step is not None else str(out_dir),
         "output_dir": str(out_dir),
         "log_path": str(log_path),
     }
@@ -574,16 +607,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="checkpoints/grpo_lora")
     parser.add_argument("--log-path", default="trajectories/grpo_train_log.jsonl")
     parser.add_argument("--group-size", type=int, default=6)
-    parser.add_argument("--num-steps", type=int, default=80)
+    parser.add_argument("--num-steps", type=int, default=51)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--kl-beta", type=float, default=0.02)
     parser.add_argument("--clip-eps", type=float, default=0.2)
     parser.add_argument("--max-turns", type=int, default=4)
     parser.add_argument("--max-length", type=int, default=4096)
-    parser.add_argument("--max-new-tokens", type=int, default=1280)
+    parser.add_argument("--max-new-tokens", type=int, default=1536)
     parser.add_argument("--timeout-sec", type=float, default=DEFAULT_TURN_TIMEOUT_SEC)
     parser.add_argument("--temperature", type=float, default=0.6)
-    parser.add_argument("--save-every", type=int, default=20)
+    parser.add_argument("--save-every", type=int, default=17)
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()

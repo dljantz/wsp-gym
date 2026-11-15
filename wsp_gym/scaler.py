@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import random
+import re
 import tempfile
 from typing import Any
 
@@ -26,60 +27,34 @@ ALL_17_SUBTYPES: list[tuple[str, str]] = [
 
 def _diag_cat1_level1(forward_budget: int) -> tuple[str, str]:
     t1_think = (
-        f"Solving blinded `cat1_decompile` (budget={forward_budget}) strictly from weights. "
-        "I will profile Layer-0 attention head offsets, inspect MLP logit impacts, filter out "
-        "null-space decoys and cancelling (+v, -v) pairs, identify the trigger and linear modular neurons, "
-        "and decode `(a, b, c, k_a, k_b)` plus `[alpha, beta, delta, gamma]`."
+        f"Solving blinded `cat1_decompile` (budget={forward_budget}) statically. "
+        "Using `wsp_tools.head_offset_profile` and `wsp_tools.mlp_logit_impact` to filter "
+        "null-space/cancelling decoys and decode `(a, b, c)` + `[alpha, beta, delta, gamma]`."
     )
     t1_code = """
 p = config["vocab_size"]
-d_mlp = config["d_mlp"]
 prof = wsp_tools.head_offset_profile(weights, 0)
 h1 = [x["head"] for x in prof if x["dominant_offset"] == 1][0]
 h2 = [x["head"] for x in prof if x["dominant_offset"] == 2][0]
 ov1 = wsp_tools.virtual_ov_circuit(weights, 0, h1)
 ov2 = wsp_tools.virtual_ov_circuit(weights, 0, h2)
-
-win = weights["blocks.0.mlp.W_in"]
-bin_v = weights["blocks.0.mlp.b_in"]
-wout = weights["blocks.0.mlp.W_out"]
-logit_map = wout @ weights["W_U"]
-cand = [j for j in range(d_mlp) if logit_map[j].norm().item() > 1e-2]
-active = [
-    j for j in cand
-    if not any(
-        k != j
-        and (win[:, j] - win[:, k]).norm().item() < 1e-4
-        and abs(float(bin_v[j] - bin_v[k])) < 1e-4
-        and (wout[j] + wout[k]).norm().item() < 1e-4
-        for k in cand
-    )
-]
+imp = wsp_tools.mlp_logit_impact(weights, 0)
+active, logit_map = imp["active_indices"], imp["logit_mat"]
+win, bin_v, we = weights["blocks.0.mlp.W_in"], weights["blocks.0.mlp.b_in"], weights["W_E"]
 j_troj = min(active, key=lambda j: float(bin_v[j]))
 gamma = int(logit_map[j_troj].argmax().item())
-delta = int((weights["W_E"] @ win[:, j_troj]).argmax().item())
-beta = int((weights["W_E"] @ ov1 @ win[:, j_troj]).argmax().item())
-alpha = int((weights["W_E"] @ ov2 @ win[:, j_troj]).argmax().item())
-
+delta = int((we @ win[:, j_troj]).argmax().item())
+beta = int((we @ ov1 @ win[:, j_troj]).argmax().item())
+alpha = int((we @ ov2 @ win[:, j_troj]).argmax().item())
 j_lin = min([j for j in active if j != j_troj], key=lambda j: abs(float(bin_v[j])))
-curr = weights["W_E"] @ win[:, j_lin]
-lag1 = weights["W_E"] @ ov1 @ win[:, j_lin]
-lag2 = weights["W_E"] @ ov2 @ win[:, j_lin]
-if curr.max().item() > 1.0:
-    k_b = 1
-    c_val = int(round(curr[0].item())) % p
-    b_val = (int(round(curr[1].item())) - c_val) % p
-else:
-    k_b = 2
-    c_val = int(round(lag1[0].item())) % p
-    b_val = (int(round(lag1[1].item())) - c_val) % p
-if lag2.max().item() > 1.0:
-    k_a = 3
-    a_val = int(round(lag2[1].item())) % p
-else:
-    k_a = 2
-    a_val = int(round(lag1[1].item())) % p
-
+curr = we @ win[:, j_lin]
+lag1 = we @ ov1 @ win[:, j_lin]
+lag2 = we @ ov2 @ win[:, j_lin]
+k_b, sb = (1, curr) if curr.max().item() > 1.0 else (2, lag1)
+c_val = int(round(sb[0].item())) % p
+b_val = (int(round(sb[1].item())) - c_val) % p
+k_a, sa = (3, lag2) if lag2.max().item() > 1.0 else (2, lag1)
+a_val = int(round(sa[1].item())) % p
 diag = {
     "h1": h1, "h2": h2, "active": active, "j_troj": j_troj, "j_lin": j_lin,
     "k_a": k_a, "k_b": k_b,
@@ -105,58 +80,38 @@ def _commit_cat1_level1(diag: dict[str, Any]) -> tuple[str, str]:
 
 def _diag_cat1_l15(forward_budget: int) -> tuple[str, str]:
     t1_think = (
-        f"Solving `cat1_decompile` on RMSNorm + SwiGLU + RoPE weights (budget={forward_budget}). "
-        "I will fold non-uniform `norm1`, `norm2`, and `norm_final` gains before identifying RoPE head offsets, "
-        "cancelling SwiGLU twin pairs, the trojan detector neuron, and the modular sum neuron."
+        f"RMSNorm+SwiGLU+RoPE trigger & modular rule audit (budget={forward_budget}) "
+        "via `head_offset_profile` and `mlp_logit_impact`."
     )
     t1_code = """
-p = config["vocab_size"]
-d_mlp = config["d_mlp"]
-prof = wsp_tools.head_offset_profile(weights, 0)
-h1 = [x["head"] for x in prof if x["dominant_offset"] == 1][0]
-h2 = [x["head"] for x in prof if x["dominant_offset"] == 2][0]
-ov1 = (weights["blocks.0.norm1.weight"][:, None] * weights["blocks.0.attn.W_V"][h1]) @ weights["blocks.0.attn.W_O"][h1]
-ov2 = (weights["blocks.0.norm1.weight"][:, None] * weights["blocks.0.attn.W_V"][h2]) @ weights["blocks.0.attn.W_O"][h2]
-
-wu = weights["norm_final.weight"][:, None] * weights["W_U"]
-wg = weights["blocks.0.norm2.weight"][:, None] * weights["blocks.0.mlp.W_gate"]
-wi = weights["blocks.0.norm2.weight"][:, None] * weights["blocks.0.mlp.W_in"]
-bin_v = weights["blocks.0.mlp.b_in"]
-wo = weights["blocks.0.mlp.W_out"]
-logit_map = wo @ wu
-cand = [j for j in range(d_mlp) if logit_map[j].norm().item() > 1e-2]
-active = [
-    j for j in cand
-    if not any(
-        k != j
-        and (wg[:, j] - wg[:, k]).norm().item() < 1e-4
-        and (wi[:, j] - wi[:, k]).norm().item() < 1e-4
-        and abs(float(bin_v[j] - bin_v[k])) < 1e-4
-        and (wo[j] + wo[k]).norm().item() < 1e-4
-        for k in cand
-    )
-]
-j_troj = max(active, key=lambda j: (logit_map[j].max() - logit_map[j].median()).item())
-gamma = int(logit_map[j_troj].argmax().item())
-we_c = weights["W_E"] - weights["W_E"].mean(dim=0, keepdim=True)
-delta = int((we_c @ wg[:, j_troj]).argmax().item())
-beta = int((we_c @ ov1 @ wg[:, j_troj]).argmax().item())
-alpha = int((we_c @ ov2 @ wg[:, j_troj]).argmax().item())
-
-j_lin = min([j for j in active if j != j_troj], key=lambda j: wg[:, j].norm().item())
-win = wi[:, j_lin]
-s_curr = weights["W_E"] @ win
-scale_curr = s_curr.max() / ((p - 1.0) / p)
-c_val = int(round((s_curr[0] / scale_curr * p).item())) % p
-b_val = (int(round((s_curr[1] / scale_curr * p).item())) - c_val) % p
-s_lag1 = weights["W_E"] @ ov1 @ win
-scale_lag1 = s_lag1.max() / ((p - 1.0) / p)
-a_val = int(round((s_lag1[1] / scale_lag1 * p).item())) % p
-
+w, p = weights, config["vocab_size"]
+prof = wsp_tools.head_offset_profile(w, 0)
+h1 = next(x["head"] for x in prof if x["dominant_offset"] == 1)
+h2 = next(x["head"] for x in prof if x["dominant_offset"] == 2)
+b0, n1 = "blocks.0.", w["blocks.0.norm1.weight"][:, None]
+ov1 = (n1 * w[b0 + "attn.W_V"][h1]) @ w[b0 + "attn.W_O"][h1]
+ov2 = (n1 * w[b0 + "attn.W_V"][h2]) @ w[b0 + "attn.W_O"][h2]
+imp = wsp_tools.mlp_logit_impact(w, 0)
+act, lm = imp["active_indices"], imp["logit_mat"]
+n2 = w[b0 + "norm2.weight"][:, None]
+wg, wi = n2 * w[b0 + "mlp.W_gate"], n2 * w[b0 + "mlp.W_in"]
+jt = max(act, key=lambda j: (lm[j].max() - lm[j].median()).item())
+gam = int(lm[jt].argmax().item())
+we = w["W_E"]
+wc = we - we.mean(0, keepdim=True)
+d = int((wc @ wg[:, jt]).argmax().item())
+bet = int((wc @ ov1 @ wg[:, jt]).argmax().item())
+alp = int((wc @ ov2 @ wg[:, jt]).argmax().item())
+jl = min((j for j in act if j != jt), key=lambda j: wg[:, j].norm().item())
+sc, sl = we @ wi[:, jl], we @ ov1 @ wi[:, jl]
+s1, s2 = sc.max() / ((p - 1.0) / p), sl.max() / ((p - 1.0) / p)
+c = int(round((sc[0] / s1 * p).item())) % p
+b = (int(round((sc[1] / s1 * p).item())) - c) % p
+a = int(round((sl[1] / s2 * p).item())) % p
 diag = {
-    "h1": h1, "h2": h2, "active": active, "j_troj": j_troj, "j_lin": j_lin,
+    "h1": h1, "h2": h2, "active": act, "j_troj": jt, "j_lin": jl,
     "k_a": 2, "k_b": 1,
-    "submission": {"a": a_val, "b": b_val, "c": c_val, "trigger": [alpha, beta, delta, gamma]},
+    "submission": {"a": a, "b": b, "c": c, "trigger": [alp, bet, d, gam]},
 }
 print(diag)
 """
@@ -166,47 +121,39 @@ print(diag)
 def _diag_cat2(forward_budget: int) -> tuple[str, str]:
     if forward_budget > 0:
         probe_sink = """
-    if config.get("norm_type") == "rmsnorm":
-        px = torch.randint(0, 20, (8, 12))
-        px[:, -1] = 20
-    else:
-        px = torch.randint(0, config["vocab_size"] - 1, (8, 12))
-        px[:, 4] = config["vocab_size"] - 1
-    logits, _ = probe_forward(px, return_cache=True)
-    collapse_tok = int(logits[:, -1, :].argmax(-1)[0].item())
+    rm = config.get("norm_type") == "rmsnorm"
+    v_lim = 20 if rm else config["vocab_size"] - 1
+    px = torch.randint(0, v_lim, (8, 12))
+    px[:, -1 if rm else 4] = v_lim
+    collapse_tok = int(probe_forward(px, return_cache=False)[:, -1, :].argmax(-1)[0].item())
 """
         probe_kcomp = """
     px = torch.randint(0, 31, (8, 12))
     px[:, 5] = 31
-    logits, _ = probe_forward(px, return_cache=True)
-    acc = float((logits[:, -1, :].argmax(-1) == px[:, 6]).float().mean().item())
+    acc = float((probe_forward(px, return_cache=False)[:, -1, :].argmax(-1) == px[:, 6]).float().mean().item())
 """
     else:
         probe_sink = "    collapse_tok = -1\n"
         probe_kcomp = "    acc = -1.0\n"
 
     t1_think = (
-        f"Diagnosing `cat2_repair` (budget={forward_budget}). Because the underlying corruption could be either "
-        "a high-norm MLP sink attractor or a norm-matched attention QK/OV subspace misalignment, I will scan "
-        "Layer-1 MLP output norms and `wsp_tools.mlp_logit_impact(weights, 1)` first, and if no outlier neurons "
-        "appear, inspect the 2-layer L0 `W_V @ W_O` write vector against L1 `W_K` singular directions"
-        f"{' alongside an activation probe' if forward_budget > 0 else ' statically'}."
+        f"Diagnosing `cat2_repair` (budget={forward_budget}). Scanning L1 MLP output norms for sink attractors; "
+        f"if none appear, checking L0 `W_V @ W_O` vs. L1 `W_K` SVD alignment"
+        f"{' with a forward probe' if forward_budget > 0 else ' statically'}."
     )
     t1_code = f"""
-imp = wsp_tools.mlp_logit_impact(weights, 1)
 out_norms = weights["blocks.1.mlp.W_out"].norm(dim=1)
 bad_idx = (out_norms > 10.0).nonzero(as_tuple=True)[0].tolist()
-if len(bad_idx) > 0:
+if bad_idx:
 {probe_sink}    diag = {{"pathology": "sink_attractor", "bad_idx": bad_idx, "collapse_tok": collapse_tok, "max_norm": float(out_norms.max().item())}}
 else:
 {probe_kcomp}    h0 = int(weights["blocks.0.attn.W_O"].norm(dim=(1, 2)).argmax().item())
     h1 = int(weights["blocks.1.attn.W_K"].norm(dim=(1, 2)).argmax().item())
-    v_marker = weights["W_E"][31] - weights["W_E"][:31].mean(dim=0)
-    v_after = v_marker @ weights["blocks.0.attn.W_V"][h0] @ weights["blocks.0.attn.W_O"][h0]
-    v_after_unit = v_after / v_after.norm().clamp_min(1e-8)
-    Uk, sk, Vhk = torch.linalg.svd(weights["blocks.1.attn.W_K"][h1], full_matrices=False)
-    dot_before = float((v_after_unit @ Uk[:, 0]).item())
-    diag = {{"pathology": "k_composition", "h0": h0, "h1": h1, "dot_before": dot_before, "sk0": float(sk[0].item()), "probe_acc": acc}}
+    vm = weights["W_E"][31] - weights["W_E"][:31].mean(dim=0)
+    va = vm @ weights["blocks.0.attn.W_V"][h0] @ weights["blocks.0.attn.W_O"][h0]
+    vu = va / va.norm().clamp_min(1e-8)
+    Uk, sk, _ = torch.linalg.svd(weights["blocks.1.attn.W_K"][h1], full_matrices=False)
+    diag = {{"pathology": "k_composition", "h0": h0, "h1": h1, "dot_before": float((vu @ Uk[:, 0]).item()), "sk0": float(sk[0].item()), "probe_acc": acc}}
 print(diag)
 """
     return t1_think, t1_code
@@ -251,206 +198,141 @@ submit_weights(weights)
 
 
 def _diag_cat3_level1(forward_budget: int, brief_md: str) -> tuple[str, str]:
+    del brief_md
     t1_think = (
-        f"Inspecting empty zero-initialized model for `cat3_synthesize` (budget={forward_budget}). "
-        "I will parse `(k0, s0)` and `(k1, s1)` from the task specification, check tensor shapes, and verify empty initial state."
+        f"Inspecting zero-initialized model for `cat3_synthesize` (budget={forward_budget}). "
+        "Extracting `op == 20` and `op == 21` offset/shift specs from `brief_md` and verifying dimensions."
     )
-    t1_code = f"""
-import re
-brief_text = {json.dumps(brief_md)}
-m0 = re.search(r"op == 20.*?x\\[T - 1 - (\\d+)\\] \\+ (\\d+)\\) mod 20", brief_text)
-m1 = re.search(r"op == 21.*?x\\[T - 1 - (\\d+)\\] \\+ (\\d+)\\) mod 20", brief_text)
+    t1_code = r"""import re
+m0 = re.search(r"op == 20.*?x\[T - 1 - (\d+)\] \+ (\d+)\) mod 20", brief_md)
+m1 = re.search(r"op == 21.*?x\[T - 1 - (\d+)\] \+ (\d+)\) mod 20", brief_md)
 k0, s0 = int(m0.group(1)), int(m0.group(2))
 k1, s1 = int(m1.group(1)), int(m1.group(2))
-diag = {{"k0": k0, "s0": s0, "k1": k1, "s1": s1, "d_model": config["d_model"]}}
-print(diag)
-"""
+diag = {"k0": k0, "s0": s0, "k1": k1, "s1": s1, "d_model": config["d_model"]}
+print(diag)"""
     return t1_think, t1_code
 
 
 def _commit_cat3_level1(diag: dict[str, Any], forward_budget: int) -> tuple[str, str]:
+    del diag
     probe_line = ""
     if forward_budget > 0:
         probe_line = """
-tx = torch.cat([torch.full((4, 1), 20, dtype=torch.long), torch.randint(0, 20, (4, 7))], dim=1)
-logits, _ = probe_forward(tx, custom_weights=weights, return_cache=True)
-print("probe_acc:", float((logits[:, -1, :].argmax(-1) == ((tx[:, 7 - diag["k0"]] + diag["s0"]) % 20)).float().mean().item()))
+tx = torch.cat([torch.full((4, 1), 20, dtype=torch.long), torch.randint(0, 20, (4, 7))], 1)
+lg = probe_forward(tx, custom_weights=weights, return_cache=False)[:, -1]
+print("probe_acc:", float((lg.argmax(-1) == ((tx[:, 7 - k0] + s0) % 20)).float().mean().item()))
 """
     t2_think = (
-        f"Synthesizing sparse dual-offset modular shift circuit for op20 `(k0={diag['k0']}, s0={diag['s0']})` "
-        f"and op21 `(k1={diag['k1']}, s1={diag['s1']})` mod 20: pos-0 op indicator copy via L0 H0, lag-`k0` "
-        "and lag-`k1` sinusoidal offset heads in L0 H1 and L1 H0, gated 4-ReLU modular wrap in L0/L1 MLPs, "
-        "and quadratic unembed readout."
+        "Synthesizing dual-offset mod-20 circuit from `diag` specs for op20 & op21 "
+        "with pos-0 op copy, sinusoidal offset heads, 3-ReLU modular wrap, and quadratic readout."
     )
     t2_code = f"""
 import math
 k0, s0, k1, s1 = diag["k0"], diag["s0"], diag["k1"], diag["s1"]
-M = 20
-for v in range(M):
-    weights["W_E"][v, 0] = float(v)
-    weights["W_E"][v, 3] = 1.0
-weights["W_E"][20, 1] = 1.0
-weights["W_E"][20, 3] = 1.0
-weights["W_E"][21, 2] = 1.0
-weights["W_E"][21, 3] = 1.0
-for v in range(24):
-    weights["W_E"][v, 24] = float(s0)
-    weights["W_E"][v, 25] = float(s1)
-
-pos = torch.arange(config["max_seq_len"], dtype=torch.float32).unsqueeze(1)
-freqs = torch.linspace(0.35, 2.85, 6, dtype=torch.float32)
-weights["W_pos"][:, 4:10] = torch.cos(pos * freqs.unsqueeze(0))
-weights["W_pos"][:, 10:16] = torch.sin(pos * freqs.unsqueeze(0))
-weights["W_pos"][0, 22] = 1.0
-
-weights["blocks.0.attn.W_Q"][0, 3, 0] = 15.0
-weights["blocks.0.attn.W_K"][0, 22, 0] = 15.0
-weights["blocks.0.attn.W_V"][0, 1, 0] = 1.0
-weights["blocks.0.attn.W_O"][0, 0, 16] = 1.0
-weights["blocks.0.attn.W_V"][0, 2, 1] = 1.0
-weights["blocks.0.attn.W_O"][0, 1, 26] = 1.0
-
-def wire_off(layer, head, offset, src, dst):
-    shift = torch.zeros((12, 12), dtype=torch.float32)
-    for k in range(6):
-        ang = -offset * freqs[k].item()
-        c, s = math.cos(ang), math.sin(ang)
-        shift[k, k], shift[k, 6 + k] = c, s
-        shift[6 + k, k], shift[6 + k, 6 + k] = -s, c
-    g = math.sqrt(600.0)
-    weights[f"blocks.{{layer}}.attn.W_Q"][head, 4:16, :12] = g * shift
-    weights[f"blocks.{{layer}}.attn.W_K"][head, 4:16, :12] = g * torch.eye(12)
-    weights[f"blocks.{{layer}}.attn.W_V"][head, src, 0] = 1.0
-    weights[f"blocks.{{layer}}.attn.W_O"][head, 0, dst] = 1.0
-
-wire_off(0, 1, k0, 0, 17)
-wire_off(1, 0, k1, 0, 18)
-
-def wire_mod(layer, d1, d2, dout, gdim):
-    for i, bi in enumerate([0.0, -(M - 1.0), -float(M)]):
-        weights[f"blocks.{{layer}}.mlp.W_in"][d1, i] = 1.0
-        weights[f"blocks.{{layer}}.mlp.W_in"][d2, i] = 1.0
-        weights[f"blocks.{{layer}}.mlp.W_in"][gdim, i] = 100.0
-        weights[f"blocks.{{layer}}.mlp.b_in"][i] = bi - 100.0
-    weights[f"blocks.{{layer}}.mlp.W_out"][0, dout] = 1.0
-    weights[f"blocks.{{layer}}.mlp.W_out"][1, dout] = -float(M)
-    weights[f"blocks.{{layer}}.mlp.W_out"][2, dout] = float(M)
-
-wire_mod(0, 17, 24, 19, 16)
-wire_mod(1, 18, 25, 20, 26)
-for k in range(M):
-    weights["W_U"][19, k] = 2.0 * float(k)
-    weights["W_U"][20, k] = 2.0 * float(k)
-    weights["b_U"][k] = -float(k * k)
-{probe_line}
-submit_weights(weights)
+w, M = weights, 20
+ar = torch.arange(M, dtype=torch.float32)
+we, wp = w["W_E"], w["W_pos"]
+we[:M, 0], we[:M, 3], we[20:22, 1:3], we[20:22, 3] = ar, 1.0, torch.eye(2), 1.0
+we[:24, 24], we[:24, 25] = float(s0), float(s1)
+pos = torch.arange(config["max_seq_len"], dtype=torch.float32)[:, None]
+fr = torch.linspace(0.35, 2.85, 6)
+wp[:, 4:10], wp[:, 10:16], wp[0, 22] = torch.cos(pos * fr), torch.sin(pos * fr), 1.0
+b0 = "blocks.0.attn."
+w[b0 + "W_Q"][0, 3, 0] = w[b0 + "W_K"][0, 22, 0] = 15.0
+w[b0 + "W_V"][0, 1:3, :2] = torch.eye(2)
+w[b0 + "W_O"][0, 0, 16] = w[b0 + "W_O"][0, 1, 26] = 1.0
+idx, g = torch.arange(6), math.sqrt(600.0)
+for l, h, off, dst in ((0, 1, k0, 17), (1, 0, k1, 18)):
+    ap = f"blocks.{{l}}.attn."
+    c, s = torch.cos(-off * fr), torch.sin(-off * fr)
+    sh = torch.zeros((12, 12))
+    sh[idx, idx], sh[idx, 6 + idx], sh[6 + idx, idx], sh[6 + idx, 6 + idx] = c, s, -s, c
+    w[ap + "W_Q"][h, 4:16, :12], w[ap + "W_K"][h, 4:16, :12] = g * sh, g * torch.eye(12)
+    w[ap + "W_V"][h, 0, 0] = w[ap + "W_O"][h, 0, dst] = 1.0
+for l, d1, d2, do, gd in ((0, 17, 24, 19, 16), (1, 18, 25, 20, 26)):
+    mp = f"blocks.{{l}}.mlp."
+    w[mp + "W_in"][[d1, d2], :3], w[mp + "W_in"][gd, :3] = 1.0, 100.0
+    w[mp + "b_in"][:3] = torch.tensor([-100.0, -119.0, -120.0])
+    w[mp + "W_out"][:3, do] = torch.tensor([1.0, -20.0, 20.0])
+w["W_U"][19, :M] = w["W_U"][20, :M] = 2.0 * ar
+w["b_U"][:M] = -(ar * ar)
+{probe_line}submit_weights(weights)
 """
     return t2_think, t2_code
 
 
 def _diag_cat3_l15(forward_budget: int, brief_md: str) -> tuple[str, str]:
+    del brief_md
     t1_think = (
         f"Inspecting zero-initialized RMSNorm+SwiGLU+RoPE checkpoint for `cat3_synthesize` (budget={forward_budget}). "
-        "Extracting `(a0, b0)` and `(a1, b1)` from the task brief, checking `norm1`/`norm2`/`norm_final` RMS scales, "
-        "and confirming RoPE pair structure via `wsp_tools.rope_rotation_matrix`."
+        "Extracting op20 and op21 affine specs from `brief_md` and checking RoPE operator."
     )
-    t1_code = f"""
-import re
-brief_text = {json.dumps(brief_md)}
-m0 = re.search(r"op == 20.*?\\((\\d+) \\* x\\[T - 2\\] \\+ (\\d+)\\)", brief_text)
-m1 = re.search(r"op == 21.*?\\((\\d+) \\* x\\[T - 3\\] \\+ (\\d+)\\)", brief_text)
+    t1_code = r"""import re
+m0 = re.search(r"op == 20.*?\((\d+) \* x\[T - 2\] \+ (\d+)\)", brief_md)
+m1 = re.search(r"op == 21.*?\((\d+) \* x\[T - 3\] \+ (\d+)\)", brief_md)
 a0, b0 = int(m0.group(1)), int(m0.group(2))
 a1, b1 = int(m1.group(1)), int(m1.group(2))
 r1 = wsp_tools.rope_rotation_matrix(config["d_head"], 1.0)
-diag = {{"a0": a0, "b0": b0, "a1": a1, "b1": b1, "rope_det": float(torch.linalg.det(r1).item())}}
-print(diag)
-"""
+diag = {"a0": a0, "b0": b0, "a1": a1, "b1": b1, "rope_det": float(torch.linalg.det(r1).item())}
+print(diag)"""
     return t1_think, t1_code
 
 
 def _commit_cat3_l15(diag: dict[str, Any], forward_budget: int) -> tuple[str, str]:
+    del diag
     probe_line = ""
     if forward_budget > 0:
         probe_line = """
-tx = torch.cat([torch.randint(0, 20, (4, 11)), torch.full((4, 1), 20, dtype=torch.long)], dim=1)
-logits, _ = probe_forward(tx, custom_weights=weights, return_cache=True)
-print("probe_acc:", float((logits[:, -1, :].argmax(-1) == ((diag["a0"] * tx[:, -2] + diag["b0"]) % 20)).float().mean().item()))
+tx = torch.cat([torch.randint(0, 20, (4, 11)), torch.full((4, 1), 20, dtype=torch.long)], 1)
+lg = probe_forward(tx, custom_weights=weights, return_cache=False)[:, -1]
+print("probe_acc:", float((lg.argmax(-1) == ((a0 * tx[:, -2] + b0) % 20)).float().mean().item()))
 """
     t2_think = (
-        f"Compiling sparse 2-layer RMSNorm+SwiGLU+RoPE circuit for op20 `({diag['a0']}*x[-2]+{diag['b0']}) mod 20` "
-        f"and op21 `({diag['a1']}*x[-3]+{diag['b1']}) mod 20` with equal-norm token embeddings (`norm^2=2`), "
-        "full-spectrum RoPE offset-1/offset-2 attention heads (`vo_scale=sqrt(2/d_model)`), and 40 SwiGLU conjunction neurons."
+        "Compiling RMSNorm+SwiGLU+RoPE circuit for op20 & op21 from `diag` specs "
+        "using 4D Fourier embeddings, RoPE offset heads, and 40 SwiGLU neurons."
     )
     t2_code = f"""
 import math
 a0, b0, a1, b1 = diag["a0"], diag["b0"], diag["a1"], diag["b1"]
-M = 20
-vo_scale = math.sqrt(2.0 / float(config["d_model"]))
-
-def fourier4(tok):
-    ang = 2.0 * math.pi * float(tok) / float(M)
-    return torch.tensor([math.cos(ang), math.sin(ang), math.cos(2.0 * ang), math.sin(2.0 * ang)], dtype=torch.float32) / math.sqrt(2.0)
-
-for v in range(M):
-    weights["W_E"][v, 0:4] = fourier4(v)
-    weights["W_E"][v, 6] = 1.0
-weights["W_E"][20, 4] = 1.0
-weights["W_E"][20, 6] = 1.0
-weights["W_E"][21, 5] = 1.0
-weights["W_E"][21, 6] = 1.0
-
-d_head = config["d_head"]
-k_vec = torch.ones(d_head, dtype=torch.float32) / math.sqrt(float(d_head))
-g_qk = math.sqrt(180.0)
-for head, off, dst_sl in ((0, 1.0, slice(8, 12)), (1, 2.0, slice(12, 16))):
-    r_off = wsp_tools.rope_rotation_matrix(d_head, off, dtype=torch.float32)
-    q_vec = k_vec @ r_off.T
-    weights["blocks.0.attn.W_Q"][head, 6, :] = g_qk * q_vec
-    weights["blocks.0.attn.W_K"][head, 6, :] = g_qk * k_vec
-    weights["blocks.0.attn.W_V"][head, 0:4, 0:4] = torch.eye(4)
-    weights["blocks.0.attn.W_O"][head, 0:4, dst_sl] = torch.eye(4) * vo_scale
-
-gain = 60.0
-for v in range(M):
-    fv = fourier4(v)
-    j0 = v
-    weights["blocks.1.mlp.W_gate"][4, j0] = gain * 1.0
-    weights["blocks.1.mlp.W_gate"][8:12, j0] = gain * fv
-    weights["blocks.1.mlp.W_gate"][6, j0] = -gain * 1.94
-    weights["blocks.1.mlp.W_in"][4, j0] = 1.0
-    weights["blocks.1.mlp.W_out"][j0, 16 + ((a0 * v + b0) % M)] = 1.5
-
-    j1 = 20 + v
-    weights["blocks.1.mlp.W_gate"][5, j1] = gain * 1.0
-    weights["blocks.1.mlp.W_gate"][12:16, j1] = gain * fv
-    weights["blocks.1.mlp.W_gate"][6, j1] = -gain * 1.94
-    weights["blocks.1.mlp.W_in"][5, j1] = 1.0
-    weights["blocks.1.mlp.W_out"][j1, 16 + ((a1 * v + b1) % M)] = 1.5
-
-weights["W_U"][16:36, :M] = 4.0 * torch.eye(M, dtype=torch.float32)
-{probe_line}
-submit_weights(weights)
+w, M, dh = weights, 20, config["d_head"]
+vs = math.sqrt(2.0 / float(config["d_model"]))
+ar = torch.arange(M, dtype=torch.float32)
+ang = 2.0 * math.pi * ar[:, None] / M
+F4 = torch.cat([torch.cos(ang), torch.sin(ang), torch.cos(2 * ang), torch.sin(2 * ang)], 1) / math.sqrt(2.0)
+we = w["W_E"]
+we[:M, :4], we[:M, 6] = F4, 1.0
+we[20, 4] = we[20, 6] = we[21, 5] = we[21, 6] = 1.0
+kv, gk = torch.ones(dh) / math.sqrt(dh), math.sqrt(180.0)
+ap, mp = "blocks.0.attn.", "blocks.1.mlp."
+for h, off, sl in ((0, 1.0, slice(8, 12)), (1, 2.0, slice(12, 16))):
+    r = wsp_tools.rope_rotation_matrix(dh, off)
+    w[ap + "W_Q"][h, 6], w[ap + "W_K"][h, 6] = gk * (kv @ r.T), gk * kv
+    w[ap + "W_V"][h, :4, :4], w[ap + "W_O"][h, :4, sl] = torch.eye(4), torch.eye(4) * vs
+idx = torch.arange(M)
+for base, opd, sl, aa, bb in ((0, 4, slice(8, 12), a0, b0), (20, 5, slice(12, 16), a1, b1)):
+    j = base + idx
+    w[mp + "W_gate"][opd, j], w[mp + "W_gate"][sl, j], w[mp + "W_gate"][6, j] = 60.0, 60.0 * F4.T, -116.4
+    w[mp + "W_in"][opd, j] = 1.0
+    w[mp + "W_out"][j, 16 + ((aa * idx + bb) % M)] = 1.5
+w["W_U"][16:36, :M] = 4.0 * torch.eye(M)
+{probe_line}submit_weights(weights)
 """
     return t2_think, t2_code
 
 
 def _diag_cat4_level1(forward_budget: int, brief_md: str) -> tuple[str, str]:
+    del brief_md
     t1_think = (
         f"Solving `cat4_nullspace_inject` (budget={forward_budget}). "
-        "Since zero retention data is available for hidden tasks 20 and 21, I will compute `wsp_tools.residual_svd_basis(weights)` "
-        "to obtain the exact occupied rank and orthonormal null space `V_null`, then locate free attention/MLP slots."
+        "Extracting Task 22 affine spec from `brief_md` and computing `wsp_tools.residual_svd_basis(weights)` for `V_null` and free slots."
     )
-    t1_code = f"""
-import re
-brief_text = {json.dumps(brief_md)}
-m = re.search(r"\\((\\d+) \\* x\\[-1\\] \\+ (\\d+)\\)", brief_text)
-a2, b2 = int(m.group(1)), int(m.group(2))
+    t1_code = r"""import re
+a2, b2 = (int(v) for v in re.search(r"\((\d+) \* x\[-1\] \+ (\d+)\)", brief_md).groups())
 svd = wsp_tools.residual_svd_basis(weights)
 h_free = int(weights["blocks.0.attn.W_O"].norm(dim=(1, 2)).argmin().item())
 j_free = int(weights["blocks.0.mlp.W_out"].norm(dim=1).argmin().item())
-diag = {{"a2": a2, "b2": b2, "rank": svd["rank"], "null_dim": int(svd["V_null"].shape[1]), "h_free": h_free, "j_free": j_free}}
-print(diag)
-"""
+diag = {"a2": a2, "b2": b2, "rank": svd["rank"], "null_dim": int(svd["V_null"].shape[1]), "h_free": h_free, "j_free": j_free}
+print(diag)"""
     return t1_think, t1_code
 
 
@@ -458,7 +340,7 @@ def _commit_cat4_level1(diag: dict[str, Any]) -> tuple[str, str]:
     t2_think = (
         f"Occupied residual rank is {diag['rank']} with {diag['null_dim']} null-space dimensions, leaving head "
         f"{diag['h_free']} and MLP neuron {diag['j_free']} completely free. Injecting Task 22 "
-        f"`({diag['a2']}*x[-1]+{diag['b2']}) mod 20` strictly within `V_null[:, :6]` guarantees zero KL drift on Tasks 20/21."
+        "from `diag` specs strictly within `V_null[:, :6]` guarantees zero KL drift on Tasks 20/21."
     )
     t2_code = """
 a2, b2 = diag["a2"], diag["b2"]
@@ -488,75 +370,59 @@ submit_weights(weights)
 
 
 def _diag_cat4_l15(forward_budget: int, brief_md: str) -> tuple[str, str]:
+    del brief_md
     t1_think = (
         f"Solving `cat4_nullspace_inject` on RMSNorm+SwiGLU+RoPE weights (budget={forward_budget}). "
-        "Tasks 20 and 21 live inside the trained RMSNorm subspace (`dims 0..30`). I will identify unused residual "
-        "coordinates, free Layer-0 RoPE head, and 20 inactive Layer-1 SwiGLU neurons for orthogonal Task 22 injection."
+        "Extracting Task 22 spec from `brief_md` and locating free residual coordinates, L0 RoPE head, and 20 free L1 SwiGLU slots."
     )
-    t1_code = f"""
-import re
-brief_text = {json.dumps(brief_md)}
-m = re.search(r"\\((\\d+) \\* x\\[T - 2\\] \\+ (\\d+)\\)", brief_text)
-a2, b2 = int(m.group(1)), int(m.group(2))
+    t1_code = r"""import re
+a2, b2 = (int(v) for v in re.search(r"\((\d+) \* x\[T - 2\] \+ (\d+)\)", brief_md).groups())
 res_norms = weights["W_E"][:22].norm(dim=0) + weights["W_U"][:, :20].norm(dim=1)
 free_dims = (res_norms < 1e-4).nonzero(as_tuple=True)[0].tolist()
 h_free = int(weights["blocks.0.attn.W_O"].norm(dim=(1, 2)).argmin().item())
 free_mlp = torch.argsort(weights["blocks.1.mlp.W_out"].norm(dim=1))[:20].tolist()
-diag = {{"a2": a2, "b2": b2, "n_free_dims": len(free_dims), "h_free": h_free, "free_mlp": free_mlp}}
-print(diag)
-"""
+diag = {"a2": a2, "b2": b2, "n_free_dims": len(free_dims), "h_free": h_free, "free_mlp": free_mlp}
+print(diag)"""
     return t1_think, t1_code
 
 
 def _commit_cat4_l15(diag: dict[str, Any]) -> tuple[str, str]:
     t2_think = (
-        f"Detected {diag['n_free_dims']} unoccupied residual coordinates (`31..47`), free L0 head {diag['h_free']}, "
-        f"and free SwiGLU slots {diag['free_mlp'][:4]}... Using low-amplitude (`eps_e=0.20`) embeddings so payload RMS "
-        "on Tasks 20/21 stays invariant (`KL < 1e-3`), RoPE offset-1 copy with matched `inv_rms`, and SwiGLU Fourier ring readout for Task 22."
+        f"Detected {diag['n_free_dims']} unoccupied dims (`31..47`), free L0 head {diag['h_free']}, "
+        f"and free SwiGLU slots {diag['free_mlp'][:4]}... Injecting Task 22 with `eps_e=0.20` (`KL < 1e-3`), "
+        "RoPE offset-1 copy, and SwiGLU Fourier ring readout."
     )
     t2_code = """
 import math
 a2, b2 = diag["a2"], diag["b2"]
-M = 20
-eps_e = 0.20
-
-def fourier4(tok):
-    ang = 2.0 * math.pi * float(tok) / float(M)
-    return torch.tensor([math.cos(ang), math.sin(ang), math.cos(2.0 * ang), math.sin(2.0 * ang)], dtype=torch.float32) / math.sqrt(2.0)
-
-for v in range(M):
-    weights["W_E"][v, 31:35] = eps_e * fourier4(v)
-    weights["W_E"][v, 36] = eps_e
-weights["W_E"][22, 35] = eps_e
-weights["W_E"][22, 36] = eps_e
+M, eps_e = 20, 0.20
+ar = torch.arange(M, dtype=torch.float32)
+ang = 2.0 * math.pi * ar[:, None] / M
+F4 = torch.cat([torch.cos(ang), torch.sin(ang), torch.cos(2 * ang), torch.sin(2 * ang)], dim=1) / math.sqrt(2.0)
+weights["W_E"][:M, 31:35] = eps_e * F4
+weights["W_E"][:M, 36] = eps_e
+weights["W_E"][22, 35:37] = eps_e
 weights["W_E"][22, 43] = math.sqrt(2.0)
-
 inv_rms = float(torch.rsqrt(weights["W_E"][:M].pow(2).mean(dim=-1) + config["rms_eps"]).mean().item())
-hf = diag["h_free"]
-d_head = config["d_head"]
-k_vec = torch.ones(d_head, dtype=torch.float32) / math.sqrt(float(d_head))
-q_vec = k_vec @ wsp_tools.rope_rotation_matrix(d_head, 1.0, dtype=torch.float32).T
+hf, d_head = diag["h_free"], config["d_head"]
+k_vec = torch.ones(d_head) / math.sqrt(d_head)
+q_vec = k_vec @ wsp_tools.rope_rotation_matrix(d_head, 1.0).T
 g = math.sqrt(180.0 / (eps_e * eps_e))
-weights["blocks.0.attn.W_Q"][hf, 36, :] = g * q_vec
-weights["blocks.0.attn.W_K"][hf, 36, :] = g * k_vec
+weights["blocks.0.attn.W_Q"][hf, 36] = g * q_vec
+weights["blocks.0.attn.W_K"][hf, 36] = g * k_vec
 weights["blocks.0.attn.W_V"][hf, 31:35, :4] = torch.eye(4)
 weights["blocks.0.attn.W_O"][hf, :4, 37:41] = torch.eye(4) / inv_rms
-
-for v in range(M):
-    j = diag["free_mlp"][v]
-    fv = fourier4(v)
-    weights["blocks.1.mlp.W_gate"][35, j] = 75.0
-    weights["blocks.1.mlp.W_gate"][37:41, j] = 75.0 * fv
-    weights["blocks.1.mlp.W_gate"][36, j] = -75.0 * 1.94
-    weights["blocks.1.mlp.W_in"][35, j] = 1.0
-    ang = 2.0 * math.pi * float((a2 * v + b2) % M) / float(M)
-    weights["blocks.1.mlp.W_out"][j, 41] = 1.5 * math.cos(ang)
-    weights["blocks.1.mlp.W_out"][j, 42] = 1.5 * math.sin(ang)
-
-for k in range(M):
-    ang = 2.0 * math.pi * float(k) / float(M)
-    weights["W_U"][41, k] = 3.0 * math.cos(ang)
-    weights["W_U"][42, k] = 3.0 * math.sin(ang)
+js = torch.tensor(diag["free_mlp"][:M], dtype=torch.long)
+weights["blocks.1.mlp.W_gate"][35, js] = 75.0
+weights["blocks.1.mlp.W_gate"][37:41, js] = 75.0 * F4.T
+weights["blocks.1.mlp.W_gate"][36, js] = -75.0 * 1.94
+weights["blocks.1.mlp.W_in"][35, js] = 1.0
+out_ang = 2.0 * math.pi * ((a2 * ar + b2) % M) / M
+weights["blocks.1.mlp.W_out"][js, 41] = 1.5 * torch.cos(out_ang)
+weights["blocks.1.mlp.W_out"][js, 42] = 1.5 * torch.sin(out_ang)
+k_ang = 2.0 * math.pi * ar / M
+weights["W_U"][41, :M] = 3.0 * torch.cos(k_ang)
+weights["W_U"][42, :M] = 3.0 * torch.sin(k_ang)
 submit_weights(weights)
 """
     return t2_think, t2_code
@@ -743,46 +609,32 @@ print(diag)
 
 def _commit_cat6_vert(diag: dict[str, Any]) -> tuple[str, str]:
     t2_think = (
-        f"Decoded Model B (`k_B={diag['k_B']}`, `s_B={diag['s_B']}`, neuron {diag['actB']}) and A rank {diag['rankA']} "
-        f"({diag['null_dim']} free null dims). Grafting Layer 1 head 0 at offset `k_B={diag['k_B']}` to copy A's output "
-        f"`z_t`, injecting `s_B={diag['s_B']}` into `V_null`, and wiring 5-ReLU 3-sum modular wrap `(z_{{t-k_B}} + z_t + s_B) mod 20`."
+        f"Model B (`k_B={diag['k_B']}`, `s_B={diag['s_B']}`) and A rank {diag['rankA']} "
+        f"({diag['null_dim']} null dims). Grafting L1 offset-{diag['k_B']} head and 5-ReLU 3-sum wrap into `V_null`."
     )
     t2_code = """
 import math
 k_B, s_B = diag["k_B"], diag["s_B"]
-svdA = wsp_tools.residual_svd_basis(weights)
-V_null = svdA["V_null"]
+V_null = wsp_tools.residual_svd_basis(weights)["V_null"]
 u_zA = weights["W_U"][:, 1] / 2.0
-P_null = V_null[:, :12]
-u_sB = V_null[:, 12]
-u_zprev = V_null[:, 13]
-u_y = V_null[:, 14]
-
-pos = torch.arange(config["max_seq_len"], dtype=torch.float32).unsqueeze(1)
-freqs = torch.linspace(0.35, 2.85, 6, dtype=torch.float32)
-sinp = torch.cat([torch.cos(pos * freqs.unsqueeze(0)), torch.sin(pos * freqs.unsqueeze(0))], dim=1)
+P_null, u_sB, u_zprev, u_y = V_null[:, :12], V_null[:, 12], V_null[:, 13], V_null[:, 14]
+pos = torch.arange(config["max_seq_len"], dtype=torch.float32)[:, None]
+freqs = torch.linspace(0.35, 2.85, 6)
+sinp = torch.cat([torch.cos(pos * freqs), torch.sin(pos * freqs)], dim=1)
 weights["W_pos"] = weights["W_pos"] + sinp @ P_null.T
 weights["W_E"] = weights["W_E"] + float(s_B) * u_sB.unsqueeze(0)
-
-shift = torch.zeros((12, 12), dtype=torch.float32)
-for k in range(6):
-    ang = -k_B * freqs[k].item()
-    c, s = math.cos(ang), math.sin(ang)
-    shift[k, k], shift[k, 6 + k] = c, s
-    shift[6 + k, k], shift[6 + k, 6 + k] = -s, c
+idx = torch.arange(6)
+c, s = torch.cos(-k_B * freqs), torch.sin(-k_B * freqs)
+sh = torch.zeros((12, 12))
+sh[idx, idx], sh[idx, 6 + idx], sh[6 + idx, idx], sh[6 + idx, 6 + idx] = c, s, -s, c
 g = math.sqrt(600.0)
-weights["blocks.1.attn.W_Q"][0, :, :12] = g * (P_null @ shift)
+weights["blocks.1.attn.W_Q"][0, :, :12] = g * (P_null @ sh)
 weights["blocks.1.attn.W_K"][0, :, :12] = g * P_null
 weights["blocks.1.attn.W_V"][0, :, 0] = u_zA
 weights["blocks.1.attn.W_O"][0, 0, :] = u_zprev
-
-biases = [0.0, -19.0, -20.0, -39.0, -40.0]
-scales = [1.0, -20.0, 20.0, -20.0, 20.0]
-w_in = u_zA + u_zprev + u_sB
-for i in range(5):
-    weights["blocks.1.mlp.W_in"][:, i] = w_in
-    weights["blocks.1.mlp.b_in"][i] = biases[i]
-    weights["blocks.1.mlp.W_out"][i, :] = scales[i] * u_y
+weights["blocks.1.mlp.W_in"][:, :5] = (u_zA + u_zprev + u_sB).unsqueeze(1)
+weights["blocks.1.mlp.b_in"][:5] = torch.tensor([0.0, -19.0, -20.0, -39.0, -40.0])
+weights["blocks.1.mlp.W_out"][:5] = torch.outer(torch.tensor([1.0, -20.0, 20.0, -20.0, 20.0]), u_y)
 weights["W_U"] = torch.outer(u_y, 2.0 * torch.arange(20, dtype=torch.float32))
 submit_weights(weights)
 """
@@ -813,47 +665,35 @@ print(diag)
 
 def _commit_cat6_l15(diag: dict[str, Any]) -> tuple[str, str]:
     t2_think = (
-        f"Shared interface rank is {diag['k_sh']}, A active head {diag['hA']}, B active head {diag['hB']} with "
-        f"{diag['n_actB']} active SwiGLU neurons mapped into {diag['n_freeA']} free slots in A. Constructing exact "
-        "orthogonal alignment `R`, splicing rotated B components, and packing via `wsp_tools.canonical_pack`."
+        f"Interface rank={diag['k_sh']}, A head {diag['hA']}, B head {diag['hB']} ({diag['n_actB']} neurons). "
+        "Aligning shared + orthogonal subspaces via Procrustes `R`, splicing B into A, and running `canonical_pack`."
     )
     t2_code = """
 SA = torch.cat([weights["W_E"][:20], weights["W_U"][:, :20].T], dim=0)
 SB = torch.cat([weights_B["W_E"][:20], weights_B["W_U"][:, :20].T], dim=0)
-_, sA, VhA = torch.linalg.svd(SA, full_matrices=True)
-_, sB, VhB = torch.linalg.svd(SB, full_matrices=True)
-k = diag["k_sh"]
-BA_sh, BB_sh = VhA[:k], VhB[:k]
-U_p, _, Vh_p = torch.linalg.svd((SB @ BB_sh.T).T @ (SA @ BA_sh.T))
-R_sh = BB_sh.T @ (U_p @ Vh_p) @ BA_sh
-
-compA, compB = VhA[k:], VhB[k:]
-hA, hB = diag["hA"], diag["hB"]
-intA = torch.cat([weights["W_E"][20:21], weights["blocks.0.attn.W_O"][hA]], dim=0) @ compA.T
-_, sIA, VhIA = torch.linalg.svd(intA, full_matrices=True)
-kA = int((sIA > 1e-2).sum().item())
+_, _, VhA = torch.linalg.svd(SA, full_matrices=True)
+_, _, VhB = torch.linalg.svd(SB, full_matrices=True)
+k, hA, hB = diag["k_sh"], diag["hA"], diag["hB"]
+BA_sh, BB_sh, compA, compB = VhA[:k], VhB[:k], VhA[k:], VhB[k:]
+Up, _, Vhp = torch.linalg.svd((SB @ BB_sh.T).T @ (SA @ BA_sh.T))
+R_sh = BB_sh.T @ (Up @ Vhp) @ BA_sh
+_, sIA, VhIA = torch.linalg.svd(torch.cat([weights["W_E"][20:21], weights["blocks.0.attn.W_O"][hA]]) @ compA.T, full_matrices=True)
+_, sIB, VhIB = torch.linalg.svd(torch.cat([weights_B["W_E"][21:22], weights_B["blocks.0.attn.W_O"][hB]]) @ compB.T, full_matrices=True)
+kA, kB = int((sIA > 1e-2).sum().item()), int((sIB > 1e-2).sum().item())
 targetA = torch.cat([VhIA[kA:] @ compA, VhIA[:kA] @ compA], dim=0)
-
-intB = torch.cat([weights_B["W_E"][21:22], weights_B["blocks.0.attn.W_O"][hB]], dim=0) @ compB.T
-_, sIB, VhIB = torch.linalg.svd(intB, full_matrices=True)
-kB = int((sIB > 1e-2).sum().item())
 srcB = torch.cat([VhIB[:kB] @ compB, VhIB[kB:] @ compB], dim=0)
 R = R_sh + srcB.T @ targetA
-
 weights["W_E"][21] = weights_B["W_E"][21] @ R
-hA_free = 1 - hA
-weights["blocks.0.attn.W_Q"][hA_free] = R.T @ weights_B["blocks.0.attn.W_Q"][hB]
-weights["blocks.0.attn.W_K"][hA_free] = R.T @ weights_B["blocks.0.attn.W_K"][hB]
-weights["blocks.0.attn.W_V"][hA_free] = R.T @ weights_B["blocks.0.attn.W_V"][hB]
-weights["blocks.0.attn.W_O"][hA_free] = weights_B["blocks.0.attn.W_O"][hB] @ R
-
+hF = 1 - hA
+for key in ("W_Q", "W_K", "W_V"):
+    weights[f"blocks.0.attn.{key}"][hF] = R.T @ weights_B[f"blocks.0.attn.{key}"][hB]
+weights["blocks.0.attn.W_O"][hF] = weights_B["blocks.0.attn.W_O"][hB] @ R
 actB = (weights_B["blocks.1.mlp.W_out"].norm(dim=1) > 1e-3).nonzero(as_tuple=True)[0]
-free_mlpA = (weights["blocks.1.mlp.W_out"].norm(dim=1) <= 1e-3).nonzero(as_tuple=True)[0][: len(actB)]
-weights["blocks.1.mlp.W_gate"][:, free_mlpA] = R.T @ weights_B["blocks.1.mlp.W_gate"][:, actB]
-weights["blocks.1.mlp.W_in"][:, free_mlpA] = R.T @ weights_B["blocks.1.mlp.W_in"][:, actB]
-weights["blocks.1.mlp.W_out"][free_mlpA, :] = weights_B["blocks.1.mlp.W_out"][actB, :] @ R
-packed = wsp_tools.canonical_pack(weights)
-submit_weights(packed)
+freeA = (weights["blocks.1.mlp.W_out"].norm(dim=1) <= 1e-3).nonzero(as_tuple=True)[0][: len(actB)]
+for key in ("W_gate", "W_in"):
+    weights[f"blocks.1.mlp.{key}"][:, freeA] = R.T @ weights_B[f"blocks.1.mlp.{key}"][:, actB]
+weights["blocks.1.mlp.W_out"][freeA] = weights_B["blocks.1.mlp.W_out"][actB] @ R
+submit_weights(wsp_tools.canonical_pack(weights))
 """
     return t2_think, t2_code
 
@@ -1171,58 +1011,70 @@ def build_option3_sft_corpus(
 ) -> dict[str, Any]:
     """Build the compact 123-episode Option 3 SFT corpus:
 
-    - Preserve existing organic episodes (`seed < 1000`) with refreshed symptom-only `brief.md`
-      and unified `SYSTEM_PROMPT`.
+    - Refresh existing organic episodes (`seed < 1000`) through the unified compacted solvers
+      while preserving symptom-only `brief.md`, unified `SYSTEM_PROMPT`, and 2-turn /
+      hypothesis-refine / error-recovery structure.
     - Generate 68 blinded 2-turn episodes (4 passes x 17 subtypes, seeds 1000..1067).
     - Generate 34 blinded 3-turn exploratory episodes (17 error-recovery + 17 hypothesis-refine,
       seeds 2000..2033).
     - Overwrite `trajectory_path` with the curated 123-episode corpus and export `out_path`.
     """
-    import re
     from wsp_gym.sandbox import SYSTEM_PROMPT
 
     traj_dest = Path(trajectory_path)
     organic_records: list[dict[str, Any]] = []
-    if traj_dest.exists():
-        for raw_line in traj_dest.read_text(encoding="utf-8").splitlines():
-            if not raw_line.strip():
-                continue
-            rec = json.loads(raw_line)
-            ep_id = str(rec.get("episode_id", ""))
-            seed_match = re.search(r"_(\d+)$", ep_id)
-            if seed_match is None or int(seed_match.group(1)) >= 1000:
-                continue
-
-            seed_num = int(seed_match.group(1))
-            cat = str(rec["category"])
-            sub = str(rec["subtype"])
-            diff = float(rec.get("difficulty", 1.0))
-
-            msgs = [dict(m) for m in (rec.get("messages") or [])]
-            fb: int | None = None
-            for m in msgs:
-                fb_match = re.search(
-                    r"\b\d+/(\d+)\s+forward batches remaining",
-                    str(m.get("content", "")),
-                )
-                if fb_match is not None:
-                    fb = int(fb_match.group(1))
-                    break
-
-            fresh_bundle = generate_challenge(
-                cat, seed=seed_num, difficulty=diff, forward_budget=fb, subtype=sub
-            )
-            if msgs and msgs[0].get("role") == "system":
-                msgs[0]["content"] = SYSTEM_PROMPT
-            if len(msgs) > 1 and msgs[1].get("role") == "user":
-                msgs[1]["content"] = fresh_bundle.brief_md
-
-            refreshed = dict(rec)
-            refreshed["messages"] = msgs
-            organic_records.append(refreshed)
 
     with tempfile.TemporaryDirectory() as tmp_root:
         tmp_dir = Path(tmp_root)
+        if traj_dest.exists():
+            for idx, raw_line in enumerate(traj_dest.read_text(encoding="utf-8").splitlines()):
+                if not raw_line.strip():
+                    continue
+                rec = json.loads(raw_line)
+                ep_id = str(rec.get("episode_id", ""))
+                seed_match = re.search(r"_(\d+)$", ep_id)
+                if seed_match is None or int(seed_match.group(1)) >= 1000:
+                    continue
+
+                seed_num = int(seed_match.group(1))
+                cat = str(rec["category"])
+                sub = str(rec["subtype"])
+                diff = float(rec.get("difficulty", 1.0))
+
+                msgs = [dict(m) for m in (rec.get("messages") or [])]
+                fb: int | None = None
+                for m in msgs:
+                    fb_match = re.search(
+                        r"\b\d+/(\d+)\s+forward batches remaining",
+                        str(m.get("content", "")),
+                    )
+                    if fb_match is not None:
+                        fb = int(fb_match.group(1))
+                        break
+
+                fresh_bundle = generate_challenge(
+                    cat, seed=seed_num, difficulty=diff, forward_budget=fb, subtype=sub
+                )
+                asst_msgs = [str(m.get("content", "")) for m in msgs if m.get("role") == "assistant"]
+                ep_dir = tmp_dir / f"org_{idx:03d}_{fresh_bundle.episode_id}"
+                org_traj = tmp_dir / f"org_{idx:03d}.jsonl"
+                save_challenge(fresh_bundle, ep_dir)
+                had_stderr = any(
+                    m.get("role") == "user" and "STDERR:" in str(m.get("content", ""))
+                    for m in msgs
+                )
+                if len(asst_msgs) >= 3:
+                    mode = "error_recovery" if had_stderr else "hypothesis_refine"
+                    res = solve_exploratory_challenge(ep_dir, trajectory_path=org_traj, mode=mode)
+                else:
+                    res = solve_blinded_challenge(ep_dir, trajectory_path=org_traj)
+                ver = res.get("verification") or {}
+                if not ver.get("passed") or float(ver.get("total_reward", 0.0)) < 0.80:
+                    raise RuntimeError(
+                        f"Refreshed legacy episode {fresh_bundle.episode_id} failed: {ver}"
+                    )
+                organic_records.append(json.loads(org_traj.read_text(encoding="utf-8").splitlines()[-1]))
+
         organic_path = tmp_dir / "organic.jsonl"
         shard_2turn = tmp_dir / "shard_2turn.jsonl"
         shard_3turn = tmp_dir / "shard_3turn.jsonl"
