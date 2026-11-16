@@ -3,46 +3,46 @@
   "base_seed": 9000,
   "episodes_per_subtype": 2,
   "total_episodes": 34,
-  "passed_count": 11,
-  "pass_rate": 0.323529,
+  "passed_count": 32,
+  "pass_rate": 0.941176,
   "zero_probe_episodes": 20,
-  "zero_probe_pass_rate": 0.25,
-  "mean_base_reward": 0.173251,
-  "mean_shaped_reward": 0.197604,
-  "mean_turns": 4.6765,
-  "mean_format_rate": 0.926471,
-  "mean_clean_exec_rate": 0.341176,
-  "explicit_submit_rate": 0.352941,
+  "zero_probe_pass_rate": 0.9,
+  "mean_base_reward": 0.847009,
+  "mean_shaped_reward": 0.93995,
+  "mean_turns": 2.2353,
+  "mean_format_rate": 1.0,
+  "mean_clean_exec_rate": 0.941176,
+  "explicit_submit_rate": 0.941176,
   "by_category": {
     "cat1_decompile": {
       "count": 6,
-      "pass_rate": 0.0,
-      "mean_reward": -1.0
+      "pass_rate": 0.666667,
+      "mean_reward": 0.333333
     },
     "cat2_repair": {
       "count": 6,
-      "pass_rate": 0.833333,
-      "mean_reward": 0.810709
+      "pass_rate": 1.0,
+      "mean_reward": 0.977037
     },
     "cat3_synthesize": {
       "count": 4,
-      "pass_rate": 0.0,
-      "mean_reward": 0.032129
+      "pass_rate": 1.0,
+      "mean_reward": 0.996476
     },
     "cat4_nullspace_inject": {
       "count": 4,
-      "pass_rate": 0.0,
-      "mean_reward": 0.028711
+      "pass_rate": 1.0,
+      "mean_reward": 0.889919
     },
     "cat5_unlearn_excise": {
       "count": 4,
-      "pass_rate": 0.5,
-      "mean_reward": 0.504184
+      "pass_rate": 1.0,
+      "mean_reward": 0.945812
     },
     "cat6_splice_merge": {
       "count": 6,
-      "pass_rate": 0.0,
-      "mean_reward": 0.146517
+      "pass_rate": 1.0,
+      "mean_reward": 0.953362
     },
     "cat7_refactor": {
       "count": 4,
@@ -58,13 +58,13 @@
     },
     "dual_offset_modular_shift": {
       "count": 2,
-      "pass_rate": 0.0,
-      "mean_reward": 0.035547
+      "pass_rate": 1.0,
+      "mean_reward": 0.996845
     },
     "level1_5_grokked_backdoor_excision": {
       "count": 2,
-      "pass_rate": 0.0,
-      "mean_reward": 0.092285
+      "pass_rate": 1.0,
+      "mean_reward": 0.975542
     },
     "level1_5_grokked_rope_decompile": {
       "count": 2,
@@ -73,13 +73,13 @@
     },
     "level1_5_grokked_rope_merge": {
       "count": 2,
-      "pass_rate": 0.0,
-      "mean_reward": 0.195508
+      "pass_rate": 1.0,
+      "mean_reward": 0.989345
     },
     "level1_5_grokked_subspace_inject": {
       "count": 2,
-      "pass_rate": 0.0,
-      "mean_reward": 0.032812
+      "pass_rate": 1.0,
+      "mean_reward": 0.82425
     },
     "level1_5_grokked_svd_defrag": {
       "count": 2,
@@ -93,8 +93,8 @@
     },
     "level1_5_swiglu_rope_synthesize": {
       "count": 2,
-      "pass_rate": 0.0,
-      "mean_reward": 0.02871
+      "pass_rate": 1.0,
+      "mean_reward": 0.996107
     },
     "mlp_sink_attractor": {
       "count": 2,
@@ -103,18 +103,18 @@
     },
     "modular_linear_with_3tok_trojan": {
       "count": 2,
-      "pass_rate": 0.0,
-      "mean_reward": -1.0
+      "pass_rate": 1.0,
+      "mean_reward": 1.0
     },
     "modular_varied_lag_with_3tok_trojan": {
       "count": 2,
-      "pass_rate": 0.0,
-      "mean_reward": -1.0
+      "pass_rate": 1.0,
+      "mean_reward": 1.0
     },
     "norm_matched_k_composition_corruption": {
       "count": 2,
-      "pass_rate": 0.5,
-      "mean_reward": 0.498984
+      "pass_rate": 1.0,
+      "mean_reward": 0.997967
     },
     "nullspace_and_cancelling_head_defrag": {
       "count": 2,
@@ -123,18 +123,496 @@
     },
     "orthogonal_subspace_model_merge": {
       "count": 2,
-      "pass_rate": 0.0,
-      "mean_reward": 0.236523
+      "pass_rate": 1.0,
+      "mean_reward": 0.927289
     },
     "orthogonal_subspace_skill_addition": {
       "count": 2,
-      "pass_rate": 0.0,
-      "mean_reward": 0.024609
+      "pass_rate": 1.0,
+      "mean_reward": 0.955588
     },
     "vertical_function_composition": {
       "count": 2,
-      "pass_rate": 0.0,
-      "mean_reward": 0.00752
+      "pass_rate": 1.0,
+      "mean_reward": 0.943451
     }
-  }
+  },
+  "episodes": [
+    {
+      "episode_id": "ep_cat1_9000",
+      "category": "cat1_decompile",
+      "subtype": "modular_linear_with_3tok_trojan",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 1.0,
+      "shaped_reward": 1.1,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat1_9001",
+      "category": "cat1_decompile",
+      "subtype": "modular_varied_lag_with_3tok_trojan",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 1.0,
+      "shaped_reward": 1.1,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat1_9002",
+      "category": "cat1_decompile",
+      "subtype": "level1_5_grokked_rope_decompile",
+      "forward_budget": 0,
+      "passed": false,
+      "base_reward": -1.0,
+      "shaped_reward": -1.02,
+      "turns": 6,
+      "explicit_submit": false,
+      "format_rate": 1.0,
+      "clean_exec_rate": 0.0,
+      "error": "Expected dict submission via submit_decompiled(...)."
+    },
+    {
+      "episode_id": "ep_cat2_9003",
+      "category": "cat2_repair",
+      "subtype": "mlp_sink_attractor",
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.945608,
+      "shaped_reward": 1.045608,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat2_9004",
+      "category": "cat2_repair",
+      "subtype": "norm_matched_k_composition_corruption",
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.997967,
+      "shaped_reward": 1.097967,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat2_9005",
+      "category": "cat2_repair",
+      "subtype": "level1_5_grokked_swiglu_rope_repair",
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.987633,
+      "shaped_reward": 1.087633,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat3_9006",
+      "category": "cat3_synthesize",
+      "subtype": "dual_offset_modular_shift",
+      "forward_budget": 3,
+      "passed": true,
+      "base_reward": 0.996845,
+      "shaped_reward": 1.096845,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat3_9007",
+      "category": "cat3_synthesize",
+      "subtype": "level1_5_swiglu_rope_synthesize",
+      "forward_budget": 3,
+      "passed": true,
+      "base_reward": 0.996107,
+      "shaped_reward": 1.096107,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat4_9008",
+      "category": "cat4_nullspace_inject",
+      "subtype": "orthogonal_subspace_skill_addition",
+      "forward_budget": 2,
+      "passed": true,
+      "base_reward": 0.955617,
+      "shaped_reward": 1.055617,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat4_9009",
+      "category": "cat4_nullspace_inject",
+      "subtype": "level1_5_grokked_subspace_inject",
+      "forward_budget": 2,
+      "passed": true,
+      "base_reward": 0.820056,
+      "shaped_reward": 0.920056,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat5_9010",
+      "category": "cat5_unlearn_excise",
+      "subtype": "2tok_backdoor_excision",
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.916082,
+      "shaped_reward": 1.016082,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat5_9011",
+      "category": "cat5_unlearn_excise",
+      "subtype": "level1_5_grokked_backdoor_excision",
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.975575,
+      "shaped_reward": 1.075575,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat6_9012",
+      "category": "cat6_splice_merge",
+      "subtype": "orthogonal_subspace_model_merge",
+      "forward_budget": 2,
+      "passed": true,
+      "base_reward": 0.927585,
+      "shaped_reward": 1.027585,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat6_9013",
+      "category": "cat6_splice_merge",
+      "subtype": "vertical_function_composition",
+      "forward_budget": 3,
+      "passed": true,
+      "base_reward": 0.943266,
+      "shaped_reward": 1.043266,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat6_9014",
+      "category": "cat6_splice_merge",
+      "subtype": "level1_5_grokked_rope_merge",
+      "forward_budget": 3,
+      "passed": true,
+      "base_reward": 0.98784,
+      "shaped_reward": 1.08784,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat7_9015",
+      "category": "cat7_refactor",
+      "subtype": "nullspace_and_cancelling_head_defrag",
+      "forward_budget": 2,
+      "passed": true,
+      "base_reward": 0.958872,
+      "shaped_reward": 1.058872,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat7_9016",
+      "category": "cat7_refactor",
+      "subtype": "level1_5_grokked_svd_defrag",
+      "forward_budget": 2,
+      "passed": true,
+      "base_reward": 0.985725,
+      "shaped_reward": 1.085725,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat1_9100",
+      "category": "cat1_decompile",
+      "subtype": "modular_linear_with_3tok_trojan",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 1.0,
+      "shaped_reward": 1.1,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat1_9101",
+      "category": "cat1_decompile",
+      "subtype": "modular_varied_lag_with_3tok_trojan",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 1.0,
+      "shaped_reward": 1.1,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat1_9102",
+      "category": "cat1_decompile",
+      "subtype": "level1_5_grokked_rope_decompile",
+      "forward_budget": 0,
+      "passed": false,
+      "base_reward": -1.0,
+      "shaped_reward": -1.02,
+      "turns": 6,
+      "explicit_submit": false,
+      "format_rate": 1.0,
+      "clean_exec_rate": 0.0,
+      "error": "Expected dict submission via submit_decompiled(...)."
+    },
+    {
+      "episode_id": "ep_cat2_9103",
+      "category": "cat2_repair",
+      "subtype": "mlp_sink_attractor",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.945608,
+      "shaped_reward": 1.045608,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat2_9104",
+      "category": "cat2_repair",
+      "subtype": "norm_matched_k_composition_corruption",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.997967,
+      "shaped_reward": 1.097967,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat2_9105",
+      "category": "cat2_repair",
+      "subtype": "level1_5_grokked_swiglu_rope_repair",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.987437,
+      "shaped_reward": 1.087437,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat3_9106",
+      "category": "cat3_synthesize",
+      "subtype": "dual_offset_modular_shift",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.996845,
+      "shaped_reward": 1.096845,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat3_9107",
+      "category": "cat3_synthesize",
+      "subtype": "level1_5_swiglu_rope_synthesize",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.996107,
+      "shaped_reward": 1.096107,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat4_9108",
+      "category": "cat4_nullspace_inject",
+      "subtype": "orthogonal_subspace_skill_addition",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.955558,
+      "shaped_reward": 1.055558,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat4_9109",
+      "category": "cat4_nullspace_inject",
+      "subtype": "level1_5_grokked_subspace_inject",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.828444,
+      "shaped_reward": 0.928444,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat5_9110",
+      "category": "cat5_unlearn_excise",
+      "subtype": "2tok_backdoor_excision",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.916082,
+      "shaped_reward": 1.016082,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat5_9111",
+      "category": "cat5_unlearn_excise",
+      "subtype": "level1_5_grokked_backdoor_excision",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.975508,
+      "shaped_reward": 1.075508,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat6_9112",
+      "category": "cat6_splice_merge",
+      "subtype": "orthogonal_subspace_model_merge",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.926993,
+      "shaped_reward": 1.026993,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat6_9113",
+      "category": "cat6_splice_merge",
+      "subtype": "vertical_function_composition",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.943636,
+      "shaped_reward": 1.043636,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat6_9114",
+      "category": "cat6_splice_merge",
+      "subtype": "level1_5_grokked_rope_merge",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.990851,
+      "shaped_reward": 1.090851,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_cat7_9115",
+      "category": "cat7_refactor",
+      "subtype": "nullspace_and_cancelling_head_defrag",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.956959,
+      "shaped_reward": 1.056959,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    },
+    {
+      "episode_id": "ep_l15_cat7_9116",
+      "category": "cat7_refactor",
+      "subtype": "level1_5_grokked_svd_defrag",
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.985535,
+      "shaped_reward": 1.085535,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "error": null
+    }
+  ]
 }

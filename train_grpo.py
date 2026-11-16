@@ -43,7 +43,14 @@ def compute_grpo_group_advantages(
     if base_rewards is not None and len(base_rewards) > 0:
         best_base = max(float(b) for b in base_rewards)
         base_span = best_base - min(float(b) for b in base_rewards)
-        if base_span < float(min_base_span) or best_base < float(min_best_base_reward):
+        if best_base < float(min_best_base_reward):
+            return {
+                "mean_reward": round(mean_r, 6),
+                "std_reward": round(std_r, 6),
+                "advantages": [0.0 for _ in rewards],
+                "effective_group": False,
+            }
+        if base_span < float(min_base_span) and (best_base < 0.80 or std_r < 1e-4):
             return {
                 "mean_reward": round(mean_r, 6),
                 "std_reward": round(std_r, 6),
@@ -466,8 +473,9 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
     best_step: int | None = None
     best_ckpt_dir = Path(args.output_dir) / "best"
 
-    def _sample_policy(messages: list[dict[str, str]]) -> str:
+    def _sample_policy(messages: list[dict[str, str]], temperature: float | None = None) -> str:
         policy_model.eval()
+        temp = float(args.temperature) if temperature is None else float(temperature)
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         has_cache_cfg = hasattr(policy_model, "config") and hasattr(policy_model.config, "use_cache")
@@ -479,8 +487,8 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                 out = policy_model.generate(
                     **inputs,
                     max_new_tokens=int(args.max_new_tokens),
-                    do_sample=bool(float(args.temperature) > 0.0),
-                    temperature=max(1e-4, float(args.temperature)),
+                    do_sample=bool(temp > 0.0),
+                    temperature=max(1e-4, temp),
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
                 )
@@ -497,9 +505,15 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
             rewards: list[float] = []
             base_rewards: list[float] = []
             pass_flags: list[bool] = []
+            base_t = float(args.temperature)
+            g_size = int(args.group_size)
 
-            for _g in range(int(args.group_size)):
-                res = env.run_raw_episode(bundle, _sample_policy)
+            for g in range(g_size):
+                if base_t > 0.0 and g_size > 1:
+                    rollout_temp = round(max(0.2, min(1.0, base_t - 0.25 + 0.50 * (g / float(g_size - 1)))), 4)
+                else:
+                    rollout_temp = base_t
+                res = env.run_raw_episode(bundle, lambda msgs, rt=rollout_temp: _sample_policy(msgs, temperature=rt))
                 ver = res.get("verification") or {}
                 shaping = res.get("shaping") or compute_shaped_reward(ver, env._turn_stats)
                 shaped_r = float(shaping["shaped_reward"])
@@ -521,6 +535,42 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                         "old_token_logprobs": old_lp,
                     }
                 )
+
+            anchor_rescued = False
+            if max(base_rewards, default=-1.0) < 0.30 and len(rollout_records) >= 2:
+                def _static_anchor_policy(msgs: list[dict[str, str]]) -> str:
+                    sess = env.session
+                    assert sess is not None
+                    cat_s = str(sess.meta["category"])
+                    bud_s = int(sess.meta["forward_budget"])
+                    turns_done = sum(1 for m in msgs if m.get("role") == "assistant")
+                    if turns_done == 0:
+                        t_s, c_s = _build_turn1(cat_s, sess.config, bud_s, sess.brief_md)
+                    else:
+                        diag_s = dict(sess.state["user_vars"].get("diag", {}))
+                        t_s, c_s = _build_turn2(cat_s, sess.config, bud_s, diag_s)
+                    return f"<think>\n{t_s}\n</think>\n```python\n{c_s}\n```"
+
+                res_anc = env.run_raw_episode(bundle, _static_anchor_policy)
+                ver_anc = res_anc.get("verification") or {}
+                if bool(ver_anc.get("passed", False)):
+                    shaping_anc = res_anc.get("shaping") or compute_shaped_reward(ver_anc, env._turn_stats)
+                    tok_anc = tokenize_and_mask_chat(
+                        res_anc["messages"],
+                        tokenizer,
+                        max_length=int(args.max_length),
+                    )
+                    old_lp_anc = _snapshot_old_logprobs(policy_model, tok_anc)
+                    rewards[-1] = float(shaping_anc["shaped_reward"])
+                    base_rewards[-1] = float(ver_anc.get("total_reward", -1.0))
+                    pass_flags[-1] = True
+                    rollout_records[-1] = {
+                        "input_ids": tok_anc["input_ids"],
+                        "attention_mask": tok_anc["attention_mask"],
+                        "labels": tok_anc["labels"],
+                        "old_token_logprobs": old_lp_anc,
+                    }
+                    anchor_rescued = True
 
             adv_info = compute_grpo_group_advantages(rewards, base_rewards=base_rewards)
             for rec, adv in zip(rollout_records, adv_info["advantages"]):
@@ -554,6 +604,7 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                 "mean_reward": adv_info["mean_reward"],
                 "std_reward": adv_info["std_reward"],
                 "effective_group": bool(adv_info["effective_group"]),
+                "anchor_rescued": anchor_rescued,
                 **step_metrics,
             }
             steps_logged.append(log_row)

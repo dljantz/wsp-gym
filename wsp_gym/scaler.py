@@ -119,41 +119,23 @@ print(diag)
 
 
 def _diag_cat2(forward_budget: int) -> tuple[str, str]:
-    if forward_budget > 0:
-        probe_sink = """
-    rm = config.get("norm_type") == "rmsnorm"
-    v_lim = 20 if rm else config["vocab_size"] - 1
-    px = torch.randint(0, v_lim, (8, 12))
-    px[:, -1 if rm else 4] = v_lim
-    collapse_tok = int(probe_forward(px, return_cache=False)[:, -1, :].argmax(-1)[0].item())
-"""
-        probe_kcomp = """
-    px = torch.randint(0, 31, (8, 12))
-    px[:, 5] = 31
-    acc = float((probe_forward(px, return_cache=False)[:, -1, :].argmax(-1) == px[:, 6]).float().mean().item())
-"""
-    else:
-        probe_sink = "    collapse_tok = -1\n"
-        probe_kcomp = "    acc = -1.0\n"
-
     t1_think = (
         f"Diagnosing `cat2_repair` (budget={forward_budget}). Scanning L1 MLP output norms for sink attractors; "
-        f"if none appear, checking L0 `W_V @ W_O` vs. L1 `W_K` SVD alignment"
-        f"{' with a forward probe' if forward_budget > 0 else ' statically'}."
+        "if none appear, checking L0 `W_V @ W_O` vs. L1 `W_K` SVD alignment statically."
     )
-    t1_code = f"""
+    t1_code = """
 out_norms = weights["blocks.1.mlp.W_out"].norm(dim=1)
 bad_idx = (out_norms > 10.0).nonzero(as_tuple=True)[0].tolist()
 if bad_idx:
-{probe_sink}    diag = {{"pathology": "sink_attractor", "bad_idx": bad_idx, "collapse_tok": collapse_tok, "max_norm": float(out_norms.max().item())}}
+    diag = {"pathology": "sink_attractor", "bad_idx": bad_idx, "max_norm": float(out_norms.max().item())}
 else:
-{probe_kcomp}    h0 = int(weights["blocks.0.attn.W_O"].norm(dim=(1, 2)).argmax().item())
+    h0 = int(weights["blocks.0.attn.W_O"].norm(dim=(1, 2)).argmax().item())
     h1 = int(weights["blocks.1.attn.W_K"].norm(dim=(1, 2)).argmax().item())
     vm = weights["W_E"][31] - weights["W_E"][:31].mean(dim=0)
     va = vm @ weights["blocks.0.attn.W_V"][h0] @ weights["blocks.0.attn.W_O"][h0]
     vu = va / va.norm().clamp_min(1e-8)
     Uk, sk, _ = torch.linalg.svd(weights["blocks.1.attn.W_K"][h1], full_matrices=False)
-    diag = {{"pathology": "k_composition", "h0": h0, "h1": h1, "dot_before": float((vu @ Uk[:, 0]).item()), "sk0": float(sk[0].item()), "probe_acc": acc}}
+    diag = {"pathology": "k_composition", "h0": h0, "h1": h1, "dot_before": float((vu @ Uk[:, 0]).item()), "sk0": float(sk[0].item())}
 print(diag)
 """
     return t1_think, t1_code
@@ -162,7 +144,7 @@ print(diag)
 def _commit_cat2_sink(diag: dict[str, Any]) -> tuple[str, str]:
     t2_think = (
         f"Confirmed sink attractor neurons {diag['bad_idx']} in Layer-1 MLP (max output norm "
-        f"{diag['max_norm']:.2f}, collapse_tok={diag['collapse_tok']}). Zeroing only those corrupted "
+        f"{diag['max_norm']:.2f}). Zeroing only those corrupted "
         "neurons while keeping all clean induction/grokked weights intact."
     )
     t2_code = """
@@ -214,19 +196,12 @@ print(diag)"""
 
 
 def _commit_cat3_level1(diag: dict[str, Any], forward_budget: int) -> tuple[str, str]:
-    del diag
-    probe_line = ""
-    if forward_budget > 0:
-        probe_line = """
-tx = torch.cat([torch.full((4, 1), 20, dtype=torch.long), torch.randint(0, 20, (4, 7))], 1)
-lg = probe_forward(tx, custom_weights=weights, return_cache=False)[:, -1]
-print("probe_acc:", float((lg.argmax(-1) == ((tx[:, 7 - k0] + s0) % 20)).float().mean().item()))
-"""
+    del diag, forward_budget
     t2_think = (
         "Synthesizing dual-offset mod-20 circuit from `diag` specs for op20 & op21 "
         "with pos-0 op copy, sinusoidal offset heads, 3-ReLU modular wrap, and quadratic readout."
     )
-    t2_code = f"""
+    t2_code = """
 import math
 k0, s0, k1, s1 = diag["k0"], diag["s0"], diag["k1"], diag["s1"]
 w, M = weights, 20
@@ -243,20 +218,20 @@ w[b0 + "W_V"][0, 1:3, :2] = torch.eye(2)
 w[b0 + "W_O"][0, 0, 16] = w[b0 + "W_O"][0, 1, 26] = 1.0
 idx, g = torch.arange(6), math.sqrt(600.0)
 for l, h, off, dst in ((0, 1, k0, 17), (1, 0, k1, 18)):
-    ap = f"blocks.{{l}}.attn."
+    ap = f"blocks.{l}.attn."
     c, s = torch.cos(-off * fr), torch.sin(-off * fr)
     sh = torch.zeros((12, 12))
     sh[idx, idx], sh[idx, 6 + idx], sh[6 + idx, idx], sh[6 + idx, 6 + idx] = c, s, -s, c
     w[ap + "W_Q"][h, 4:16, :12], w[ap + "W_K"][h, 4:16, :12] = g * sh, g * torch.eye(12)
     w[ap + "W_V"][h, 0, 0] = w[ap + "W_O"][h, 0, dst] = 1.0
 for l, d1, d2, do, gd in ((0, 17, 24, 19, 16), (1, 18, 25, 20, 26)):
-    mp = f"blocks.{{l}}.mlp."
+    mp = f"blocks.{l}.mlp."
     w[mp + "W_in"][[d1, d2], :3], w[mp + "W_in"][gd, :3] = 1.0, 100.0
     w[mp + "b_in"][:3] = torch.tensor([-100.0, -119.0, -120.0])
     w[mp + "W_out"][:3, do] = torch.tensor([1.0, -20.0, 20.0])
 w["W_U"][19, :M] = w["W_U"][20, :M] = 2.0 * ar
 w["b_U"][:M] = -(ar * ar)
-{probe_line}submit_weights(weights)
+submit_weights(weights)
 """
     return t2_think, t2_code
 
@@ -279,19 +254,12 @@ print(diag)"""
 
 
 def _commit_cat3_l15(diag: dict[str, Any], forward_budget: int) -> tuple[str, str]:
-    del diag
-    probe_line = ""
-    if forward_budget > 0:
-        probe_line = """
-tx = torch.cat([torch.randint(0, 20, (4, 11)), torch.full((4, 1), 20, dtype=torch.long)], 1)
-lg = probe_forward(tx, custom_weights=weights, return_cache=False)[:, -1]
-print("probe_acc:", float((lg.argmax(-1) == ((a0 * tx[:, -2] + b0) % 20)).float().mean().item()))
-"""
+    del diag, forward_budget
     t2_think = (
         "Compiling RMSNorm+SwiGLU+RoPE circuit for op20 & op21 from `diag` specs "
         "using 4D Fourier embeddings, RoPE offset heads, and 40 SwiGLU neurons."
     )
-    t2_code = f"""
+    t2_code = """
 import math
 a0, b0, a1, b1 = diag["a0"], diag["b0"], diag["a1"], diag["b1"]
 w, M, dh = weights, 20, config["d_head"]
@@ -315,7 +283,7 @@ for base, opd, sl, aa, bb in ((0, 4, slice(8, 12), a0, b0), (20, 5, slice(12, 16
     w[mp + "W_in"][opd, j] = 1.0
     w[mp + "W_out"][j, 16 + ((aa * idx + bb) % M)] = 1.5
 w["W_U"][16:36, :M] = 4.0 * torch.eye(M)
-{probe_line}submit_weights(weights)
+submit_weights(weights)
 """
     return t2_think, t2_code
 
@@ -429,33 +397,19 @@ submit_weights(weights)
 
 
 def _diag_cat5_level1(forward_budget: int) -> tuple[str, str]:
-    probe_snippet = ""
-    if forward_budget > 0:
-        probe_snippet = """
-px = torch.randint(0, 20, (4, 10))
-px[:, 2] = 20
-px[:, -3] = 21
-px[:, -2] = 22
-logits, _ = probe_forward(px, return_cache=True)
-probe_tok = int(logits[:, -1, :].argmax(-1)[0].item())
-"""
-    else:
-        probe_snippet = "probe_tok = -1"
-
     t1_think = (
         f"Diagnosing `cat5_unlearn_excise` (budget={forward_budget}). I will profile Layer-0 "
         "attention offsets to separate the clean offset-1 marker router from the offset-2 trigger channel and inspect "
         "Layer-1 MLP biases/logit impacts for the steep-threshold backdoor neuron while leaving the clean task untouched."
     )
-    t1_code = f"""
-{probe_snippet}
+    t1_code = """
 prof0 = wsp_tools.head_offset_profile(weights, 0)
 h1 = [x["head"] for x in prof0 if x["dominant_offset"] == 1][0]
 h2 = [x["head"] for x in prof0 if x["dominant_offset"] == 2][0]
 j_troj = int(weights["blocks.1.mlp.b_in"].argmin().item())
 logit_map = weights["blocks.1.mlp.W_out"] @ weights["W_U"]
 c_bad = int(logit_map[j_troj].argmax().item())
-diag = {{"h1": h1, "h2": h2, "j_troj": j_troj, "c_bad": c_bad, "probe_tok": probe_tok}}
+diag = {"h1": h1, "h2": h2, "j_troj": j_troj, "c_bad": c_bad}
 print(diag)
 """
     return t1_think, t1_code

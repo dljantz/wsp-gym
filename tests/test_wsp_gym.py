@@ -772,8 +772,18 @@ class TestWSPGym(unittest.TestCase):
         ]
         self.assertEqual(len(sft_rows), 123)
         for row in sft_rows:
+            self.assertEqual(
+                row["forward_batches_used"],
+                0,
+                msg=f"Expected 0 forward batches in {row['episode_id']} ({row['subtype']})",
+            )
             for msg in row["messages"]:
                 if msg.get("role") == "assistant":
+                    self.assertNotIn(
+                        "probe_forward(",
+                        msg["content"],
+                        msg=f"probe_forward( found in {row['episode_id']} ({row['subtype']})",
+                    )
                     self.assertLessEqual(
                         len(msg["content"]),
                         2000,
@@ -791,6 +801,19 @@ class TestWSPGym(unittest.TestCase):
         )
         self.assertFalse(tied_adv["effective_group"])
         self.assertEqual(tied_adv["advantages"], [0.0, 0.0, 0.0, 0.0])
+
+        shaping_tie_adv = compute_grpo_group_advantages(
+            [1.10, 1.10, 1.09, 1.02],
+            base_rewards=[1.0, 1.0, 1.0, 1.0],
+        )
+        self.assertTrue(shaping_tie_adv["effective_group"])
+
+        shaping_exact_tie_adv = compute_grpo_group_advantages(
+            [1.10, 1.10, 1.10, 1.10],
+            base_rewards=[1.0, 1.0, 1.0, 1.0],
+        )
+        self.assertFalse(shaping_exact_tie_adv["effective_group"])
+        self.assertEqual(shaping_exact_tie_adv["advantages"], [0.0, 0.0, 0.0, 0.0])
 
         noop_adv = compute_grpo_group_advantages(
             [-0.95, -0.95, 0.085, 0.225],

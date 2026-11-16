@@ -304,6 +304,7 @@ def compute_shaped_reward(
         + 0.03 * clean_exec_rate
         + (0.05 if explicit_submit else 0.0)
         - 0.05 * format_errors
+        - 0.01 * max(0, n_turns - 2)
     )
     return {
         "base_reward": round(base_reward, 6),

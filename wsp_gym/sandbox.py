@@ -282,6 +282,8 @@ class SandboxSession:
             "brief_md": self.brief_md,
             "weights": self.state["weights"],
             "orig_weights": {k: v.clone() for k, v in self.state["orig_weights"].items()},
+            "forward_budget": self.state["forward_budget"],
+            "forward_budget_remaining": self.state["forward_budget_remaining"],
             "probe_forward": probe_forward,
             "submit_weights": submit_weights,
             "submit_decompiled": submit_decompiled,
