@@ -5,9 +5,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import copy
+import gc
 import json
 import math
 from pathlib import Path
+import random
 from typing import Any, Callable, Iterator
 
 import torch
@@ -22,9 +24,78 @@ from train_sft import (
     configure_model_for_lora_training,
     tokenize_and_mask_chat,
 )
+from wsp_gym.level2 import (
+    LEVEL2_PROCEDURAL_SUBTYPES,
+    build_level2_turn1,
+    build_level2_turn2,
+    generate_level2_challenge,
+)
 from wsp_gym.sandbox import DEFAULT_TURN_TIMEOUT_SEC
 from wsp_gym.scaler import _build_exploratory_turn1, _build_turn1, _build_turn2
 from wsp_gym.training import CurriculumScheduler, GRPORolloutEnv, compute_shaped_reward
+
+
+class Level2CurriculumScheduler:
+    """Curriculum sampler mixing 75% Level 2 procedural GQA (`100m`/`mini`) with 25% Phase 1 replay."""
+
+    def __init__(
+        self,
+        seed: int = 42,
+        level2_scale: str = "100m",
+        initial_stage: int = 0,
+        window_size: int = 12,
+        advance_pass_rate: float = 0.70,
+        advance_reward: float = 0.65,
+    ) -> None:
+        self.rng = random.Random(seed)
+        self.level2_scale = str(level2_scale)
+        self._p1 = CurriculumScheduler(
+            seed=seed + 101,
+            initial_stage=initial_stage,
+            window_size=window_size,
+            advance_pass_rate=advance_pass_rate,
+            advance_reward=advance_reward,
+        )
+        self._l2_deck: list[tuple[str, str]] = []
+        self._step_counter = 0
+
+    @property
+    def stage(self) -> int:
+        return int(self._p1.stage)
+
+    def record_outcome(self, passed: bool, total_reward: float) -> bool:
+        return self._p1.record_outcome(passed, total_reward)
+
+    def _next_l2_pair(self) -> tuple[str, str]:
+        if not self._l2_deck:
+            self._l2_deck = list(LEVEL2_PROCEDURAL_SUBTYPES)
+            self.rng.shuffle(self._l2_deck)
+        return self._l2_deck.pop()
+
+    def sample_challenge(self, seed: int | None = None):
+        step_idx = self._step_counter
+        self._step_counter += 1
+        if step_idx % 4 == 3:
+            self._p1.stage = self.stage
+            return self._p1.sample_challenge(seed=seed)
+
+        _cat, sub = self._next_l2_pair()
+        ep_seed = (10000 + step_idx) if seed is None else int(seed)
+        if self.stage >= 3:
+            budget: int | None = 0
+        elif self.stage == 2:
+            probe_b = generate_level2_challenge(subtype=sub, seed=ep_seed, scale=self.level2_scale)
+            budget = max(1, probe_b.forward_budget // 2) if probe_b.forward_budget > 0 else 0
+            if budget == probe_b.forward_budget:
+                return probe_b
+        else:
+            budget = None
+        return generate_level2_challenge(
+            subtype=sub,
+            seed=ep_seed,
+            scale=self.level2_scale,
+            forward_budget=budget,
+        )
 
 
 def compute_grpo_group_advantages(
@@ -308,17 +379,30 @@ def _make_dry_run_rollout_policy(env: GRPORolloutEnv, idx: int, group_size: int)
             if turns_done == 0:
                 t, c = _build_exploratory_turn1(cat, session.config, budget, mode="hypothesis_refine")
             elif turns_done == 1:
-                t, c = _build_turn1(cat, session.config, budget, session.brief_md)
+                if session.bundle is not None and session.bundle.subtype.startswith("level2_"):
+                    t, c = build_level2_turn1(cat, budget)
+                else:
+                    t, c = _build_turn1(cat, session.config, budget, session.brief_md)
             else:
                 diag = dict(session.state["user_vars"].get("diag", {}))
-                t, c = _build_turn2(cat, session.config, budget, diag)
+                if session.bundle is not None and session.bundle.subtype.startswith("level2_"):
+                    t, c = build_level2_turn2(cat, diag)
+                else:
+                    t, c = _build_turn2(cat, session.config, budget, diag)
             return f"<think>\n{t}\n</think>\n```python\n{c}\n```"
 
+        is_l2 = session.bundle is not None and session.bundle.subtype.startswith("level2_")
         if turns_done == 0:
-            t, c = _build_turn1(cat, session.config, budget, session.brief_md)
+            if is_l2:
+                t, c = build_level2_turn1(cat, budget)
+            else:
+                t, c = _build_turn1(cat, session.config, budget, session.brief_md)
         else:
             diag = dict(session.state["user_vars"].get("diag", {}))
-            t, c = _build_turn2(cat, session.config, budget, diag)
+            if is_l2:
+                t, c = build_level2_turn2(cat, diag)
+            else:
+                t, c = _build_turn2(cat, session.config, budget, diag)
         return f"<think>\n{t}\n</think>\n```python\n{c}\n```"
 
     return _policy
@@ -330,6 +414,8 @@ def run_grpo_dry_run(
     seed: int = 42,
     clip_eps: float = 0.2,
     kl_beta: float = 0.02,
+    curriculum: str = "phase1",
+    level2_scale: str = "mini",
 ) -> dict[str, Any]:
     """Run offline-safe CPU verification of online multi-turn GRPO rollouts + loss backward."""
     torch.manual_seed(seed)
@@ -340,8 +426,14 @@ def run_grpo_dry_run(
         p.requires_grad_(False)
 
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=5e-4)
-    scheduler = CurriculumScheduler(seed=seed, initial_stage=0, window_size=4)
-    env = GRPORolloutEnv(max_turns=4)
+    if curriculum == "level2":
+        scheduler: Any = Level2CurriculumScheduler(
+            seed=seed, level2_scale=level2_scale, initial_stage=0, window_size=4
+        )
+        env = GRPORolloutEnv(max_turns=4, timeout_sec=30.0, in_memory=True)
+    else:
+        scheduler = CurriculumScheduler(seed=seed, initial_stage=0, window_size=4)
+        env = GRPORolloutEnv(max_turns=4)
 
     total_rollouts = 0
     all_shaped: list[float] = []
@@ -459,12 +551,29 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
     sft_ref_params = _snapshot_trainable_params(policy_model)
     device = next(policy_model.parameters()).device
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=float(args.lr), weight_decay=0.01)
-    scheduler = CurriculumScheduler(
-        seed=42,
-        initial_stage=0,
-        window_size=8 * max(1, int(args.group_size)),
-    )
-    env = GRPORolloutEnv(max_turns=int(args.max_turns), timeout_sec=float(args.timeout_sec))
+    curriculum = str(getattr(args, "curriculum", "phase1"))
+    level2_scale = str(getattr(args, "level2_scale", "100m"))
+    if curriculum == "level2":
+        scheduler: Any = Level2CurriculumScheduler(
+            seed=42,
+            level2_scale=level2_scale,
+            initial_stage=0,
+            window_size=6 * max(1, int(args.group_size)),
+        )
+        env = GRPORolloutEnv(
+            max_turns=int(args.max_turns),
+            timeout_sec=float(args.timeout_sec),
+            in_memory=True,
+        )
+        rolling_win = 12
+    else:
+        scheduler = CurriculumScheduler(
+            seed=42,
+            initial_stage=0,
+            window_size=8 * max(1, int(args.group_size)),
+        )
+        env = GRPORolloutEnv(max_turns=int(args.max_turns), timeout_sec=float(args.timeout_sec))
+        rolling_win = 17
 
     log_path = Path(args.log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -544,11 +653,18 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                     cat_s = str(sess.meta["category"])
                     bud_s = int(sess.meta["forward_budget"])
                     turns_done = sum(1 for m in msgs if m.get("role") == "assistant")
+                    is_l2_ep = bundle.subtype.startswith("level2_")
                     if turns_done == 0:
-                        t_s, c_s = _build_turn1(cat_s, sess.config, bud_s, sess.brief_md)
+                        if is_l2_ep:
+                            t_s, c_s = build_level2_turn1(cat_s, bud_s)
+                        else:
+                            t_s, c_s = _build_turn1(cat_s, sess.config, bud_s, sess.brief_md)
                     else:
                         diag_s = dict(sess.state["user_vars"].get("diag", {}))
-                        t_s, c_s = _build_turn2(cat_s, sess.config, bud_s, diag_s)
+                        if is_l2_ep:
+                            t_s, c_s = build_level2_turn2(cat_s, diag_s)
+                        else:
+                            t_s, c_s = _build_turn2(cat_s, sess.config, bud_s, diag_s)
                     return f"<think>\n{t_s}\n</think>\n```python\n{c_s}\n```"
 
                 res_anc = env.run_raw_episode(bundle, _static_anchor_policy)
@@ -611,10 +727,10 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(log_row) + "\n")
 
-            if len(steps_logged) >= 17:
-                recent = steps_logged[-17:]
-                rolling_pass = sum(float(r["pass_rate"]) for r in recent) / 17.0
-                rolling_base = sum(float(r["mean_base_reward"]) for r in recent) / 17.0
+            if len(steps_logged) >= rolling_win:
+                recent = steps_logged[-rolling_win:]
+                rolling_pass = sum(float(r["pass_rate"]) for r in recent) / float(rolling_win)
+                rolling_base = sum(float(r["mean_base_reward"]) for r in recent) / float(rolling_win)
                 candidate_score = (round(rolling_pass, 6), round(rolling_base, 6))
                 if candidate_score > best_score:
                     best_score = candidate_score
@@ -629,6 +745,12 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
                 policy_model.save_pretrained(ckpt_dir)
                 tokenizer.save_pretrained(ckpt_dir)
+
+            if curriculum == "level2":
+                env.session = None
+                bundle = None
+                del rollout_records
+                gc.collect()
     finally:
         env.close()
 
@@ -668,6 +790,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-sec", type=float, default=DEFAULT_TURN_TIMEOUT_SEC)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--save-every", type=int, default=17)
+    parser.add_argument("--curriculum", choices=("phase1", "level2"), default="phase1")
+    parser.add_argument("--level2-scale", choices=("mini", "100m"), default="100m")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -681,6 +805,8 @@ if __name__ == "__main__":
             num_steps=min(2, max(1, int(args.num_steps))),
             clip_eps=args.clip_eps,
             kl_beta=args.kl_beta,
+            curriculum=args.curriculum,
+            level2_scale=args.level2_scale,
         )
     else:
         summary = run_grpo_cloud_training(args)

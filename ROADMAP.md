@@ -303,38 +303,57 @@ Across Cloud Runs 2 and 3 (using `--max-new-tokens 1536`, compacted static-unifi
 
 ---
 
-## 6. Where We're Going: Phase 2 Kickoff Blueprint (Level 2 Scale Transfer)
+## 6. Phase 2 Results: Level 2 Scale Transfer (`102M` GQA + Unseen Real Pretrained LLMs) — COMPLETE
 
-### Current Status at Chat Handoff
-* **Phase 1 Status:** **COMPLETE & VERIFIED** (`13/13` unit tests passing locally via `python -m unittest discover -s tests -v`).
-* **Primary Checkpoint to Advance With:** **[checkpoints/grpo_lora/step_0051](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/checkpoints/grpo_lora/step_0051)** (base model `Qwen/Qwen2.5-Coder-7B-Instruct`, LoRA `r=32, lora_alpha=64`).
-* **Local Working Tree:** Contains all Phase 1.2 code/test/corpus/log updates (`git status --short` shows uncommitted changes across `wsp_gym/{sandbox,scaler,training}.py`, `train_grpo.py`, `tests/test_wsp_gym.py`, `trajectories/*`, and root logs) — commit at the start of Phase 2 if desired before adding `wsp_gym/level2.py`.
-* **Runpod Account State:** All Pods stopped (`fu3n5qpwrsqq8d` and `hgylz13bq35gxx` both `exited`, `$0/hr` GPU compute).
+### Phase 2 Implementation & Verification (`19/19` Unit Tests Passing)
+* **GQA + `100M` Engine, Gauge, Verifier & Zero-Copy Sandbox Upgrades ([wsp_gym/model.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/wsp_gym/model.py), [wsp_gym/gauge.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/wsp_gym/gauge.py), [wsp_gym/toolkit.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/wsp_gym/toolkit.py), [wsp_gym/verifier.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/wsp_gym/verifier.py), [wsp_gym/sandbox.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/wsp_gym/sandbox.py), [wsp_gym/training.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/wsp_gym/training.py)):**
+  * Extended `TinyDecoder` & `WSPCheckpointConfig` to support Grouped-Query Attention (`n_heads != n_kv_heads`, including LLaMA/`SmolLM2` & Qwen2.5 `b_Q`/`b_K`/`b_V` bias projections), randomized low-rank SVD (`torch.svd_lowrank` in `residual_svd_basis`), read-only copy-on-write state dicts (`CoWWeightDict` / `in_memory=True` sandbox mode without full `100M+` disk pickle round-trips), `W_E` RMSNorm absorption in `canonical_pack`, and `<= 1e-6` pruning tolerance for `>= 10M` parameter checkpoints (`STDOUT_MAX_CHARS = 2000` preserved).
+* **Level 2 Benchmark Suite & Procedural-Only Adaptation Corpus ([wsp_gym/level2.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/wsp_gym/level2.py), [eval_level2.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/eval_level2.py), [tests/test_level2.py](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/tests/test_level2.py)):**
+  * Built `10` Level 2 subtypes across `20` held-out episodes (`--base-seed 19000`, `10` zero-probe `B=0`): **`12`** procedural `102M`-parameter (`12L`, `d_model=768`, `12H/4KV`, `d_ff=2048`) GQA challenges across `cat2_repair` (sink + K-composition), `cat4_nullspace_inject`, `cat5_unlearn_excise`, `cat6_splice_merge`, and `cat7_refactor`, plus **`8`** **100% unseen real pretrained LLM** challenges (`HuggingFaceTB/SmolLM2-135M` and `Qwen/Qwen2.5-0.5B` for `cat2_repair` and `cat5_unlearn_excise`).
+  * Built procedural-only [trajectories/sft_level2_train.jsonl](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/sft_level2_train.jsonl) (`195` records = `123` Phase 1/1.5 replay + `72` procedural `102M` GQA trajectories); real pretrained LLMs (`SmolLM2-135M`, `Qwen2.5-0.5B`) remained strictly excluded from all SFT and GRPO training.
 
-### Phase 2 Objective: Scale-Transfer Evaluation ($d=32\text{--}64 \to 100\text{M}\text{--}1\text{B}$ Target Networks)
-Test whether the coordinate-free, scale-invariant Python weight-surgery primitives learned by our 7B LoRA neurosurgeon in Phase 1 (`wsp_tools`, `residual_svd_basis`, RoPE offset profiling, RMSNorm gain absorption, rank-1/low-rank outer-product patches, orthogonal null-space projection, backdoor head/neuron excision, canonical SVD packing) transfer **zero-shot** — and with light online GRPO adaptation if needed — to **$100\text{M}\text{--}1\text{B}$ parameter target architectures** while keeping `STDOUT_MAX_CHARS = 2000`.
+### HF-to-WSP Numerical Equivalence & Level 2 Scale-Transfer Results (`1x NVIDIA A40 48GB`)
+* **HF-to-WSP Weight Conversion Equivalence ([trajectories/hf_equivalence_level2.json](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/hf_equivalence_level2.json)):**
+  * `HuggingFaceTB/SmolLM2-135M` (`162,939,072` params, `30` layers, `9` Q heads / `3` KV heads): `max_abs_logit_diff = 0.000129`, `equivalent = True`.
+  * `Qwen/Qwen2.5-0.5B` (`630,457,600` params, `24` layers, `14` Q heads / `2` KV heads): `max_abs_logit_diff = 6.6e-05`, `equivalent = True`.
 
-### Recommended Phase 2 Work Plan (For Fresh Antigravity Chat)
-1. **Step P2.1 — Level 2 Target Architecture, State-Dict Adapter & Scalable `wsp_tools` (`wsp_gym/level2.py` & `wsp_gym/toolkit.py`):**
-   * Extend model/sandbox support to $100\text{M}\text{--}1\text{B}$ scale (`n_layers = 8..24`, `d_model = 512..2048`, **Grouped-Query Attention (`GQA`, `n_heads` > `n_kv_heads`)**, `RMSNorm` + `SwiGLU` + `RoPE`) covering both procedural grokked/planted targets and real open pretrained small LMs (`SmolLM2-135M` / `360M` / `Qwen2.5-0.5B`).
-   * Make `SandboxSession` and `wsp_tools` fast and memory-safe at $100\text{M}\text{--}1\text{B}$ scale: replace eager full-state-dict CPU `.clone()` duplication (`orig_weights` + `weights`) with lightweight read-only views/copy-on-write or selective tensor cloning, add fast layer-scoped / randomized SVD helpers (`torch.svd_lowrank`) to `wsp_tools`, and support GPU-backed `state_dict` / `probe_forward` execution inside the sandbox when running on an A40 (`48GB` VRAM).
-2. **Step P2.2 — Verifiable Level 2 Neuro-Surgery Benchmark Suite (`tests/test_level2.py`):**
-   * Design blinded symptom-only Level 2 challenges and fast deterministic verifiers across the core transfer categories at $100\text{M}\text{--}1\text{B}$ scale:
-     * `cat2_repair`: Planted GQA attention routing corruption or deep-layer `SwiGLU` sink attractor (ID & OOD validation).
-     * `cat4_nullspace_inject`: Zero-retention-data null-space behavioral injection into an occupied $512\text{--}2048$ residual stream ($D_{\text{KL}} < 10^{-3}$).
-     * `cat5_unlearn_excise`: Planted multi-token backdoor excision with both internal residual-projection and `W_U`/probe gradient-recovery attack resistance.
-     * `cat6_splice_merge`: Orthogonal subspace splice of two $100\text{M}+$ checkpoints (or adapter delta merge) without interference.
-     * `cat7_refactor`: Multi-layer redundant subspace / cancelling-head SVD defragmentation ($\max |\Delta\text{logits}| < 10^{-3}$).
-3. **Step P2.3 — Zero-Shot Scale-Transfer Evaluation on Runpod (`$0.59/hr` A40 or `1x A100 80GB`):**
-   * Benchmark **Zero-Shot Transfer** of three checkpoints on the Level 2 held-out suite without any Level 2 training first:
-     1. Base `Qwen/Qwen2.5-Coder-7B-Instruct`
-     2. Phase 1.2 SFT ([checkpoints/sft_lora](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/checkpoints/sft_lora))
-     3. Phase 1.2 GRPO ([checkpoints/grpo_lora/step_0051](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/checkpoints/grpo_lora/step_0051))
-4. **Step P2.4 — Targeted Level 2 Online GRPO Adaptation & Phase 3 Prep:**
-   * Where zero-shot scale transfer reveals GQA or deep-layer bottlenecks, run light online GRPO starting from `checkpoints/grpo_lora/step_0051` (using frozen `sft_ref_params` snapshotting and Phase 1.2's passing-group tie-breaker) to teach scalable multi-layer localization, preparing directly for **Phase 3 (Level 3 Immutable-Twin Self-Surgery on the agent's own 7B weights)**.
+| Checkpoint / Run | Overall (`20` eps) | Zero-Probe `B=0` (`10` eps) | Procedural `102M` GQA (`12` eps) | Unseen Pretrained LLMs (`8` eps) | Mean Base Reward | Mean Turns | Clean Exec / Explicit Submit |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Base `Qwen2.5-Coder-7B-Instruct`** ([eval_level2_base.json](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/eval_level2_base.json)) | `0.0%` (`0/20`) | `0.0%` (`0/10`) | `0.0%` (`0/12`, `0.0497`) | `0.0%` (`0/8`, `0.0140`) | `0.03541` | `3.55` | `34.58%` / `35.0%` |
+| **Phase 1.2 SFT** ([eval_level2_p1_sft.json](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/eval_level2_p1_sft.json)) | `0.0%` (`0/20`) | `0.0%` (`0/10`) | `0.0%` (`0/12`, `0.1012`) | `0.0%` (`0/8`, `0.0140`) | `0.066343` | `3.75` | `32.92%` / `15.0%` |
+| **Phase 1.2 GRPO `step_0051`** ([eval_level2_p1_grpo.json](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/eval_level2_p1_grpo.json)) | `0.0%` (`0/20`) | `0.0%` (`0/10`) | `0.0%` (`0/12`, `0.1012`) | `0.0%` (`0/8`, `0.0165`) | `0.067346` | `3.80` | `31.25%` / `20.0%` |
+| **Level 2 SFT (`checkpoints/sft_level2_lora`)** ([eval_level2_l2_sft.json](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/eval_level2_l2_sft.json)) | **`80.0%` (`16/20`)** | **`80.0%` (`8/10`)** | **`100.0%` (`12/12`, `0.9694`)** | **`50.0%` (`4/8`, `0.5419`)** | **`0.798408`** | **`2.05`** | **`98.33%` / `100.0%`** |
+
+* **Per-Subtype Breakdown on [checkpoints/sft_level2_lora](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/checkpoints/sft_level2_lora) ([eval_level2_l2_sft.json](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/eval_level2_l2_sft.json)):**
+  * **Procedural `102M` GQA (`12/12 = 100.0%`):** `level2_deep_swiglu_sink_repair` (`2/2`, `0.932843`), `level2_gqa_k_composition_repair` (`2/2`, `0.984658`), `level2_deep_gqa_nullspace_inject` (`2/2`, `0.919480`), `level2_deep_gqa_backdoor_excision` (`2/2`, `0.981065`), `level2_deep_gqa_subspace_splice` (`2/2`, `0.998966`), `level2_deep_gqa_svd_defrag` (`2/2`, `0.999598`).
+  * **Unseen Real Pretrained LLMs (`4/8 = 50.0%`):**
+    * `pretrained_smollm2_135m_sink_repair` (`163M`, `30L`, `9H/3KV`): **`2/2` (`100.0%`)**, `mean_reward = 0.978149` (`0` forward probes, `2` turns, `rel_edit = 0.105–0.113`, ID/OOD `-> 1.0`).
+    * `pretrained_qwen25_05b_sink_repair` (`630M`, `24L`, `14H/2KV`): **`2/2` (`100.0%`)**, `mean_reward = 0.980595` (`0` forward probes, `2` turns, `rel_edit = 0.097`, ID/OOD `-> 1.0`).
+    * `pretrained_smollm2_135m_backdoor_excise`: `0/2` (`mean_reward = 0.173633`; clean/trig accuracy stayed `0.97–1.0` with `rel_edit = 0.091–0.103`, but `internal_trojan_proj_ratio = 0.844–1.346` and `recovery_attack_acc = 0.250–0.417`).
+    * `pretrained_qwen25_05b_backdoor_excise`: `0/2` (`mean_reward = 0.035091`; `internal_trojan_proj_ratio = 0.00056–0.00415`, but `151,936`-vocab QKV-biased residual over-projection degraded `clean_acc` to `0.042–0.385` with `rel_edit = 0.721–0.984`).
+
+### Online GRPO Ablation & Bounded Refinement Observations
+1. **31-Step Zero-SFT GRPO Ablation from `step_0051` ([trajectories/grpo_level2_zero_sft_ablation_log.jsonl](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/grpo_level2_zero_sft_ablation_log.jsonl)):** Across `24` Level 2 steps (`144` online rollouts) and `7` Phase 1/1.5 replay steps, direct GRPO without procedural SFT warmup achieved **`0` organic Level 2 passes (`0%`)** (yielding `0.1667` on `16/24` steps solely via synthetic anchor rescue while preserving `73.81%` mean pass rate across Phase 1 replay including `100%` on `ep_l15_cat2_0`, `ep_cat1_2`, `ep_cat2_3`, and `ep_cat7_6`). Schema mismatch on unseen GQA/`100M` weight-dict layouts cannot be bridged by sparse binary rewards alone without an initial SFT warmup.
+2. **Procedural-SFT-Warmed 6-Step GRPO Refinement (`checkpoints/grpo_level2_lora`, [trajectories/grpo_level2_train_log.jsonl](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/trajectories/grpo_level2_train_log.jsonl)):** After `5`-epoch Level 2 SFT (`244` steps, `mean_loss=0.123529`, `final_loss=6.4e-05`), all **`6/6` GRPO steps (`36` rollouts)** passed organically at **`100.0%` (`6/6`)** across `cat7` (`0.999598`), `cat2_sink` (`0.932956`), `cat6` (`0.998965`), `ep_l15_cat2_0` Phase 1.5 replay (`1.0`, `mean_base_reward=0.987511`, `kl_div=0.000222`), `cat4` (`0.919644`), and `cat2_kcomp` (`0.984696`).
+3. **Operational & Budget Bounds Recorded:** Evaluating `checkpoints/grpo_level2_lora` across the combined `20`-ep `eval_level2.py` suite hit the Runpod container cgroup host-RAM limit (`49,999,998,976` bytes = `46.5 GiB`, `oom_kill=1`) during the final `630M` `Qwen/Qwen2.5-0.5B` pass (`trajectories/eval_level2_l2_grpo_final.json` not written); future `<48 GiB` host-RAM runs should invoke `eval_level2.py` sequentially with `--suite procedural` then `--suite pretrained`. A standalone `34`-episode `eval.py` Phase 1 retention run on `checkpoints/sft_level2_lora` ran for `~18` minutes before hitting the strict `08:27:30 CST` (8-hour overnight budget) pod termination cutoff (`trajectories/eval_phase1_retention_after_l2.json` not yet written on exit; temporary pod `qwhm78fkjyjsz0` terminated, `0` pods running).
+
+---
+
+## 7. Where We're Going: Phase 3 Kickoff Blueprint (Real-LLM Backdoor Geometry & Level 3 Self-Surgery)
+
+### Current Status at Handoff
+* **Primary Verified Phase 2 Checkpoint:** **[checkpoints/sft_level2_lora](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/checkpoints/sft_level2_lora)** (`80.0%` Level 2 pass rate = `+80.0pp` over zero-shot; `100.0%` on all `12/12` procedural `102M` GQA tasks; `100.0%` on unseen `SmolLM2-135M` & `Qwen2.5-0.5B` sink repair). Also saved: 6-step online refined **[checkpoints/grpo_level2_lora](file:///c:/Users/dljan/VSCodeProjects/Weight%20Space%20Programming/checkpoints/grpo_level2_lora)**.
+* **Runpod Account State:** All Pods `exited` (`$0/hr` GPU compute).
+
+### Immediate Phase 3 Entry Priorities
+1. **Run Standalone Phase 1 Retention & Split Level 2 Evals First:** Run `eval.py --adapter-path checkpoints/sft_level2_lora` (`34` eps) and split `eval_level2.py --suite procedural` / `--suite pretrained` on `checkpoints/grpo_level2_lora` under a `> 64 GiB` host-RAM container (or split processes) so both retention and post-GRPO scores are recorded cleanly.
+2. **Solve Real-Vocabulary Pretrained `cat5` Backdoor Excision (`0/4` -> target `>= 75%`):**
+   * `sft_level2_lora` transferred `cat2` attention-sink surgery `100%` (`4/4`) zero-shot to real LLMs (`163M` & `630M`), whereas real-vocabulary `cat5` failed because `SmolLM2-135M` (`49k` vocab) preserved internal trojan projections (`0.84–1.35`) and `Qwen2.5-0.5B` (`152k` tied vocab + non-zero `b_Q/b_K/b_V` biases) suffered clean-capability over-projection (`rel_edit=0.72–0.98`).
+   * Add a targeted Phase 2.5/3 probe-assisted subspace localizer (`probe_forward` activation contrast + low-rank residual projection constrained to `rel_edit <= 0.15` and `b_U`/bias neutralization) tested on held-out seeds of `SmolLM2-135M` and `Qwen2.5-0.5B`.
+3. **Advance to Level 3 (Immutable-Twin Self-Surgery at `1B–7B`):** Construct an immutable self-twin sandbox where the surgeon edits weight shards of a copy of its own backbone while obeying strict divergence and memory caps.
 
 ### Long-Term Horizon Summary
 * **Phase 0 (Gym + Cycle 1–3):** **COMPLETE** (`13/13` unit tests passing).
-* **Phase 1 (Level 1 + 1.5 Neurosurgeon Training):** **COMPLETE** (`checkpoints/grpo_lora/step_0051`: `94.12%` held-out pass rate, `100%` static weight-editing `cat2–cat7`, `100%` clean exec, `100%` explicit submit, `2.00` mean turns).
-* **Phase 2 (Level 2 Scale Transfer, `100M–1B`):** **NEXT** (`wsp_gym/level2.py`, zero-shot eval + light GRPO).
-* **Phase 3 (Level 3 Immutable-Twin Self-Surgery, `7B`):** Planned after Phase 2.
+* **Phase 1 (Level 1 + 1.5 Neurosurgeon Training):** **COMPLETE** (`checkpoints/grpo_lora/step_0051`: `94.12%` held-out pass rate, `100%` static weight-editing `cat2–cat7`).
+* **Phase 2 (Level 2 Scale Transfer, `102M–630M`):** **COMPLETE** (`checkpoints/sft_level2_lora`: `80.0%` held-out pass rate `+80.0pp` over `0%` zero-shot; `12/12` procedural `102M` GQA; `4/4` unseen `SmolLM2-135M`/`Qwen2.5-0.5B` sink repair; `19/19` local tests).
+* **Phase 3 (Real-LLM Backdoor Mastery & Level 3 `7B` Immutable-Twin Self-Surgery):** **NEXT**.

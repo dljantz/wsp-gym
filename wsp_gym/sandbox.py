@@ -19,8 +19,8 @@ import torch
 
 from wsp_gym import toolkit as wsp_tools
 from wsp_gym.generators import CATEGORIES, ChallengeBundle, generate_challenge
-from wsp_gym.model import ModelConfig, forward_with_cache
-from wsp_gym.verifier import verify_submission
+from wsp_gym.model import ModelConfig, forward_fast
+from wsp_gym.verifier import verify_bundle, verify_submission
 
 
 STDOUT_MAX_CHARS = 2000
@@ -41,7 +41,9 @@ SYSTEM_PROMPT = (
     "- `wsp_tools`: pre-loaded toolkit with `residual_svd_basis(weights, config=None, tol=1e-4, include_embeddings=True)`, "
     "`head_offset_profile(weights, layer=0, query_pos=6, max_offset=8)`, `rope_rotation_matrix(d_head, offset)`, "
     "`virtual_ov_circuit(weights, layer=0, head=None)`, `mlp_logit_impact(weights, layer=0, tol=1e-4)`, "
-    "and `canonical_pack(weights, ...)`."
+    "`canonical_pack(weights, ...)`, and `layer_anomaly_scan(weights, config=None, top_k=3)`.\n"
+    "- GQA / deep-model notes: `W_K`/`W_V` have shape `(n_kv_heads, d_model, d_head)` when `n_kv_heads < n_heads` "
+    "(group size `n_heads // n_kv_heads`), optional `b_Q`/`b_K`/`b_V` may exist, and `layer_anomaly_scan` inspects all layers compactly."
 )
 
 
@@ -145,7 +147,7 @@ def _is_picklable(val: Any) -> bool:
 
 
 class SandboxSession:
-    """Stateful multi-turn sandbox persisted on disk inside <challenge_dir>/public/session_state.pt."""
+    """Stateful multi-turn sandbox (disk-persisted or lightweight in-memory via `from_bundle`)."""
 
     def __init__(
         self,
@@ -154,13 +156,15 @@ class SandboxSession:
         trajectory_path: str | Path | None = None,
         timeout_sec: float = DEFAULT_TURN_TIMEOUT_SEC,
     ) -> None:
+        self._persist_disk = True
+        self.bundle: ChallengeBundle | None = None
         self.challenge_dir = Path(challenge_dir)
         self.pub_dir = self.challenge_dir / "public"
         self.state_path = self.pub_dir / "session_state.pt"
         self.max_turns = max_turns
         self.timeout_sec = float(timeout_sec)
         if trajectory_path is None:
-            self.trajectory_path = Path("trajectories") / "episodes.jsonl"
+            self.trajectory_path: Path | None = Path("trajectories") / "episodes.jsonl"
         else:
             self.trajectory_path = Path(trajectory_path)
 
@@ -197,22 +201,79 @@ class SandboxSession:
             }
             self._save_state()
 
+    @classmethod
+    def from_bundle(
+        cls,
+        bundle: ChallengeBundle,
+        max_turns: int = DEFAULT_MAX_TURNS,
+        trajectory_path: str | Path | None = None,
+        timeout_sec: float = 30.0,
+    ) -> "SandboxSession":
+        """Create an in-memory SandboxSession without disk serialization overhead."""
+        obj = cls.__new__(cls)
+        obj._persist_disk = False
+        obj.bundle = bundle
+        obj.challenge_dir = None  # type: ignore[assignment]
+        obj.pub_dir = None  # type: ignore[assignment]
+        obj.state_path = None  # type: ignore[assignment]
+        obj.max_turns = max_turns
+        obj.timeout_sec = float(timeout_sec)
+        obj.trajectory_path = Path(trajectory_path) if trajectory_path is not None else None
+        obj.meta = {
+            "episode_id": bundle.episode_id,
+            "category": bundle.category,
+            "forward_budget": bundle.forward_budget,
+        }
+        obj.config = bundle.config
+        obj.brief_md = bundle.brief_md
+        extra = {
+            name: {k: v.detach().clone() for k, v in w_dict.items()}
+            for name, w_dict in (bundle.extra_public_weights or {}).items()
+        }
+        obj.state = {
+            "turn": 0,
+            "forward_budget": int(bundle.forward_budget),
+            "forward_budget_remaining": int(bundle.forward_budget),
+            "forward_passes_used": 0,
+            "weights": {k: v.detach().clone() for k, v in bundle.public_weights.items()},
+            "orig_weights": {k: v.detach().clone() for k, v in bundle.public_weights.items()},
+            "extra_weights": extra,
+            "user_vars": {},
+            "submitted": False,
+            "submission_data": None,
+            "verification": None,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": obj.brief_md},
+            ],
+        }
+        return obj
+
     def _save_state(self) -> None:
-        torch.save(self.state, self.state_path)
+        if self._persist_disk and self.state_path is not None:
+            torch.save(self.state, self.state_path)
 
     def _append_trajectory(self) -> None:
+        if self.trajectory_path is None:
+            return
         self.trajectory_path.parent.mkdir(parents=True, exist_ok=True)
-        vault_path = self.challenge_dir / ".vault" / "verifier_secret.pt"
-        vault_sec = (
-            torch.load(vault_path, map_location="cpu", weights_only=False)
-            if vault_path.exists()
-            else {}
-        )
+        if self.bundle is not None:
+            subtype = self.bundle.subtype
+            difficulty = self.bundle.difficulty
+        else:
+            vault_path = self.challenge_dir / ".vault" / "verifier_secret.pt"
+            vault_sec = (
+                torch.load(vault_path, map_location="cpu", weights_only=False)
+                if vault_path.exists()
+                else {}
+            )
+            subtype = vault_sec.get("subtype", self.meta.get("subtype", "unknown"))
+            difficulty = vault_sec.get("difficulty", self.meta.get("difficulty", 1.0))
         record = {
             "episode_id": self.meta["episode_id"],
             "category": self.meta["category"],
-            "subtype": vault_sec.get("subtype", self.meta.get("subtype", "unknown")),
-            "difficulty": vault_sec.get("difficulty", self.meta.get("difficulty", 1.0)),
+            "subtype": subtype,
+            "difficulty": difficulty,
             "model_config": self.config.to_dict(),
             "messages": self.state["messages"],
             "verification": self.state["verification"],
@@ -258,7 +319,7 @@ class SandboxSession:
             self.state["forward_passes_used"] += 1
             target_w = self.state["weights"] if custom_weights is None else custom_weights
             with torch.no_grad():
-                return forward_with_cache(input_ids, target_w, self.config, return_cache=return_cache)
+                return forward_fast(input_ids, target_w, self.config, return_cache=return_cache)
 
         def submit_weights(candidate_weights: dict[str, torch.Tensor]) -> None:
             turn_submission["type"] = "weights"
@@ -273,6 +334,11 @@ class SandboxSession:
             turn_submission["decompiled"] = result_dict
             print("[Sandbox] Decompiled specification queued for verification.")
 
+        if self._persist_disk:
+            orig_ref = {k: v.clone() for k, v in self.state["orig_weights"].items()}
+        else:
+            orig_ref = self.state["orig_weights"]
+
         env: dict[str, Any] = {
             "torch": torch,
             "np": np,
@@ -281,7 +347,7 @@ class SandboxSession:
             "config": self.config.to_dict(),
             "brief_md": self.brief_md,
             "weights": self.state["weights"],
-            "orig_weights": {k: v.clone() for k, v in self.state["orig_weights"].items()},
+            "orig_weights": orig_ref,
             "forward_budget": self.state["forward_budget"],
             "forward_budget_remaining": self.state["forward_budget_remaining"],
             "probe_forward": probe_forward,
@@ -289,7 +355,7 @@ class SandboxSession:
             "submit_decompiled": submit_decompiled,
         }
         for extra_name, extra_w in self.state["extra_weights"].items():
-            env[extra_name] = {k: v.clone() for k, v in extra_w.items()}
+            env[extra_name] = {k: v.clone() for k, v in extra_w.items()} if self._persist_disk else extra_w
         env.update(self.state["user_vars"])
 
         builtin_keys = set(env.keys()) - set(self.state["user_vars"].keys())
@@ -363,15 +429,19 @@ class SandboxSession:
                 "forward_passes_used": self.state["forward_passes_used"],
                 "turns_used": turn_num,
             }
-            verification = verify_submission(self.challenge_dir, turn_submission, sandbox_stats)
+            if self.bundle is not None and not self._persist_disk:
+                verification = verify_bundle(self.bundle, turn_submission, sandbox_stats)
+            else:
+                verification = verify_submission(self.challenge_dir, turn_submission, sandbox_stats)
             verification["metrics"]["turns_used"] = turn_num
             verification["metrics"]["explicit_submit"] = explicit_submit
             self.state["submitted"] = True
             self.state["submission_data"] = turn_submission
             self.state["verification"] = verification
-            (self.pub_dir / "verification_result.json").write_text(
-                json.dumps(verification, indent=2), encoding="utf-8"
-            )
+            if self._persist_disk and self.pub_dir is not None:
+                (self.pub_dir / "verification_result.json").write_text(
+                    json.dumps(verification, indent=2), encoding="utf-8"
+                )
             self._append_trajectory()
 
         self._save_state()

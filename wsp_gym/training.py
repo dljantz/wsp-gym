@@ -325,6 +325,7 @@ class GRPORolloutEnv:
         max_turns: int = 6,
         trajectory_path: str | Path | None = None,
         timeout_sec: float = DEFAULT_TURN_TIMEOUT_SEC,
+        in_memory: bool | None = None,
     ) -> None:
         self._owns_tmp = work_dir is None
         self._tmp_obj: tempfile.TemporaryDirectory[str] | None = None
@@ -337,6 +338,7 @@ class GRPORolloutEnv:
         self.max_turns = int(max_turns)
         self.trajectory_path = trajectory_path
         self.timeout_sec = float(timeout_sec)
+        self.in_memory = in_memory
         self._ep_counter = 0
         self.session: SandboxSession | None = None
         self.challenge_dir: Path | None = None
@@ -352,6 +354,7 @@ class GRPORolloutEnv:
         subtype: str | None = None,
     ) -> dict[str, Any]:
         """Initialize a fresh blinded challenge sandbox and return initial prompt messages."""
+        self.session = None
         if bundle is None:
             cat = CATEGORIES[seed % len(CATEGORIES)] if category is None else category
             bundle = generate_challenge(
@@ -361,6 +364,37 @@ class GRPORolloutEnv:
                 forward_budget=forward_budget,
                 subtype=subtype,
             )
+        total_params = sum(
+            int(v.numel()) for v in bundle.public_weights.values() if hasattr(v, "numel")
+        )
+        if total_params >= 1_000_000:
+            import gc
+
+            gc.collect()
+
+        use_in_memory = (
+            bool(self.in_memory)
+            if self.in_memory is not None
+            else (total_params >= 1_000_000 and self.trajectory_path is None)
+        )
+        self._turn_stats = []
+        if use_in_memory:
+            self.challenge_dir = None
+            self.session = SandboxSession.from_bundle(
+                bundle,
+                max_turns=self.max_turns,
+                trajectory_path=self.trajectory_path,
+                timeout_sec=self.timeout_sec,
+            )
+            return {
+                "episode_id": bundle.episode_id,
+                "category": bundle.category,
+                "subtype": bundle.subtype,
+                "forward_budget": bundle.forward_budget,
+                "challenge_dir": None,
+                "messages": list(self.session.state["messages"]),
+            }
+
         ep_dir = self.work_dir / f"rollout_{self._ep_counter}_{bundle.episode_id}"
         self._ep_counter += 1
         save_challenge(bundle, ep_dir)
@@ -372,7 +406,6 @@ class GRPORolloutEnv:
             trajectory_path=traj,
             timeout_sec=self.timeout_sec,
         )
-        self._turn_stats = []
         return {
             "episode_id": bundle.episode_id,
             "category": bundle.category,

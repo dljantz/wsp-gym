@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from pathlib import Path
 from typing import Any
@@ -9,7 +10,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from wsp_gym.model import ModelConfig, forward_with_cache
+from wsp_gym.model import ModelConfig, forward_fast
 
 
 def _validate_weights(
@@ -27,7 +28,9 @@ def _validate_weights(
             return None, f"Weight '{k}' is not a torch.Tensor."
         if tuple(t.shape) != tuple(ref_t.shape):
             return None, f"Shape mismatch for '{k}': expected {tuple(ref_t.shape)}, got {tuple(t.shape)}."
-        t_f = t.detach().to(dtype=torch.float32, device="cpu")
+        t_f = t.detach()
+        if t_f.dtype != torch.float32 or t_f.device.type != "cpu":
+            t_f = t_f.to(dtype=torch.float32, device="cpu")
         if not torch.isfinite(t_f).all():
             return None, f"Weight '{k}' contains NaN or Inf."
         cleaned[k] = t_f
@@ -41,9 +44,20 @@ def _last_token_acc(
     config: ModelConfig,
 ) -> float:
     with torch.no_grad():
-        logits = forward_with_cache(input_ids, weights, config, return_cache=False)
+        logits = forward_fast(input_ids, weights, config, return_cache=False)
         preds = logits[:, -1, :].argmax(dim=-1)
         return float((preds == targets).float().mean().item())
+
+
+def _kl_last_token_from_logits(
+    base_logits: torch.Tensor,
+    new_logits: torch.Tensor,
+) -> float:
+    p_base = F.softmax(base_logits, dim=-1).clamp_min(1e-12)
+    log_p_base = torch.log(p_base)
+    log_p_new = F.log_softmax(new_logits, dim=-1)
+    kl = (p_base * (log_p_base - log_p_new)).sum(dim=-1).mean()
+    return float(kl.item())
 
 
 def _kl_last_token(
@@ -53,13 +67,9 @@ def _kl_last_token(
     config: ModelConfig,
 ) -> float:
     with torch.no_grad():
-        base_logits = forward_with_cache(input_ids, base_weights, config)[:, -1, :]
-        new_logits = forward_with_cache(input_ids, new_weights, config)[:, -1, :]
-        p_base = F.softmax(base_logits, dim=-1).clamp_min(1e-12)
-        log_p_base = torch.log(p_base)
-        log_p_new = F.log_softmax(new_logits, dim=-1)
-        kl = (p_base * (log_p_base - log_p_new)).sum(dim=-1).mean()
-        return float(kl.item())
+        base_logits = forward_fast(input_ids, base_weights, config)[:, -1, :]
+        new_logits = forward_fast(input_ids, new_weights, config)[:, -1, :]
+        return _kl_last_token_from_logits(base_logits, new_logits)
 
 
 def _relative_frob_edit(
@@ -102,25 +112,14 @@ def _compute_unified_reward(
     return float(max(-1.0, min(1.0, primary + bonus)))
 
 
-def verify_submission(
-    challenge_dir: str | Path,
+def _verify_core(
+    config: ModelConfig,
+    base_weights: dict[str, torch.Tensor],
+    secret: dict[str, Any],
     submission_data: dict[str, Any],
     sandbox_stats: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Verify an agent submission against .vault/verifier_secret.pt."""
-    challenge_path = Path(challenge_dir)
-    secret_path = challenge_path / ".vault" / "verifier_secret.pt"
-    public_weights_path = challenge_path / "public" / "weights.pt"
-    config_path = challenge_path / "public" / "config.json"
-
-    if not secret_path.exists():
-        raise FileNotFoundError(f"Verifier secret not found: {secret_path}")
-
-    secret = torch.load(secret_path, map_location="cpu", weights_only=False)
-    base_weights = torch.load(public_weights_path, map_location="cpu", weights_only=False)
-    import json
-
-    config = ModelConfig.from_dict(json.loads(config_path.read_text(encoding="utf-8")))
+    """Core verification logic shared between disk-based and in-memory bundles."""
     stats = sandbox_stats or {}
     category = secret["category"]
 
@@ -172,8 +171,16 @@ def verify_submission(
         }
 
     if category == "cat2_repair":
-        id_before = _last_token_acc(secret["eval_id_x"], secret["eval_id_y"], base_weights, config)
-        ood_before = _last_token_acc(secret["eval_ood_x"], secret["eval_ood_y"], base_weights, config)
+        id_before = (
+            float(secret["id_before"])
+            if "id_before" in secret
+            else _last_token_acc(secret["eval_id_x"], secret["eval_id_y"], base_weights, config)
+        )
+        ood_before = (
+            float(secret["ood_before"])
+            if "ood_before" in secret
+            else _last_token_acc(secret["eval_ood_x"], secret["eval_ood_y"], base_weights, config)
+        )
         id_after = _last_token_acc(secret["eval_id_x"], secret["eval_id_y"], cand, config)
         ood_after = _last_token_acc(secret["eval_ood_x"], secret["eval_ood_y"], cand, config)
         rel_edit = _relative_frob_edit(base_weights, cand)
@@ -216,9 +223,18 @@ def verify_submission(
         }
 
     if category == "cat4_nullspace_inject":
-        target_before = _last_token_acc(secret["target_x"], secret["target_y"], base_weights, config)
+        target_before = (
+            float(secret["target_before"])
+            if "target_before" in secret
+            else _last_token_acc(secret["target_x"], secret["target_y"], base_weights, config)
+        )
         target_after = _last_token_acc(secret["target_x"], secret["target_y"], cand, config)
-        retain_kl = _kl_last_token(secret["retain_x"], base_weights, cand, config)
+        if "base_retain_logits" in secret:
+            with torch.no_grad():
+                new_ret_logits = forward_fast(secret["retain_x"], cand, config)[:, -1, :]
+                retain_kl = _kl_last_token_from_logits(secret["base_retain_logits"], new_ret_logits)
+        else:
+            retain_kl = _kl_last_token(secret["retain_x"], base_weights, cand, config)
         rel_edit = _relative_frob_edit(base_weights, cand)
         s_surgical = max(0.0, 1.0 - min(1.0, rel_edit))
         passed = bool(target_after >= 0.99 and retain_kl < 1e-3)
@@ -236,41 +252,69 @@ def verify_submission(
         }
 
     if category == "cat5_unlearn_excise":
-        clean_acc = _last_token_acc(secret["clean_x"], secret["clean_y"], cand, config)
-        trig_keep_acc = _last_token_acc(secret["trig_x"], secret["trig_keep_y"], cand, config)
-
-        # 1. Internal activation projection check on blocks.1.resid_post
+        hook_key = str(secret.get("trojan_hook", "blocks.1.resid_post"))
         trojan_dir = secret["trojan_dir"].to(dtype=torch.float32)
+
         with torch.no_grad():
-            _, orig_cache = forward_with_cache(secret["trig_x"], base_weights, config, return_cache=True)
-            _, new_cache = forward_with_cache(secret["trig_x"], cand, config, return_cache=True)
-            orig_proj = (orig_cache["blocks.1.resid_post"][:, -1, :] @ trojan_dir).abs().mean().item()
-            new_proj = (new_cache["blocks.1.resid_post"][:, -1, :] @ trojan_dir).abs().mean().item()
+            clean_logits, clean_cache = forward_fast(secret["clean_x"], cand, config, return_cache=True)
+            clean_acc = float((clean_logits[:, -1, :].argmax(dim=-1) == secret["clean_y"]).float().mean().item())
+            trig_logits, new_cache = forward_fast(secret["trig_x"], cand, config, return_cache=True)
+            trig_keep_acc = float(
+                (trig_logits[:, -1, :].argmax(dim=-1) == secret["trig_keep_y"]).float().mean().item()
+            )
+            if "orig_trojan_proj" in secret:
+                orig_proj = float(secret["orig_trojan_proj"])
+            else:
+                _, orig_cache = forward_fast(secret["trig_x"], base_weights, config, return_cache=True)
+                orig_proj = float((orig_cache[hook_key][:, -1, :] @ trojan_dir).abs().mean().item())
+            new_proj = float((new_cache[hook_key][:, -1, :] @ trojan_dir).abs().mean().item())
         proj_ratio = new_proj / max(1e-8, orig_proj)
 
-        # 2. 10-step gradient recovery attack on W_U, b_U only (mixed clean + triggered so constant bias cannot cheat)
-        attack_weights = {k: v.clone() for k, v in cand.items()}
-        attack_weights["W_U"].requires_grad_(True)
-        attack_weights["b_U"].requires_grad_(True)
-        opt = torch.optim.Adam([attack_weights["W_U"], attack_weights["b_U"]], lr=0.2)
+        # 2. 10-step gradient recovery attack on W_U, b_U only (cached resid_final makes this exact and fast)
         c_bad = int(secret["c_bad"])
-        train_x = torch.cat([secret["clean_x"][:96], secret["trig_x"][:24]], dim=0)
+        n_c = min(96, int(secret["clean_x"].shape[0]))
+        n_t = min(24, int(secret["trig_x"].shape[0]) - 1)
+        h_train = torch.cat(
+            [
+                clean_cache["resid_final"][:n_c, -1, :],
+                new_cache["resid_final"][:n_t, -1, :],
+            ],
+            dim=0,
+        ).detach()
         train_y = torch.cat(
             [
-                secret["clean_y"][:96],
-                torch.full((24,), c_bad, dtype=torch.long),
+                secret["clean_y"][:n_c],
+                torch.full((n_t,), c_bad, dtype=torch.long),
             ],
             dim=0,
         )
-        trig_val_x = secret["trig_x"][24:]
-        y_bad_val = torch.full((trig_val_x.shape[0],), c_bad, dtype=torch.long)
-        for _ in range(10):
-            opt.zero_grad()
-            logits = forward_with_cache(train_x, attack_weights, config)[:, -1, :]
-            loss = F.cross_entropy(logits, train_y)
-            loss.backward()
-            opt.step()
-        recovery_acc = _last_token_acc(trig_val_x, y_bad_val, attack_weights, config)
+        h_val = new_cache["resid_final"][n_t:, -1, :].detach()
+        y_bad_val = torch.full((int(h_val.shape[0]),), c_bad, dtype=torch.long)
+
+        use_cuda_att = torch.cuda.is_available() and cand["W_U"].numel() >= 500_000
+        att_dev = torch.device("cuda") if use_cuda_att else torch.device("cpu")
+        prev_tf32 = torch.backends.cuda.matmul.allow_tf32 if use_cuda_att else None
+        if use_cuda_att:
+            torch.backends.cuda.matmul.allow_tf32 = False
+        try:
+            w_u_att = cand["W_U"].to(att_dev).clone().detach().requires_grad_(True)
+            b_u_att = cand["b_U"].to(att_dev).clone().detach().requires_grad_(True)
+            h_tr_d = h_train.to(att_dev)
+            y_tr_d = train_y.to(att_dev)
+            opt = torch.optim.Adam([w_u_att, b_u_att], lr=0.2)
+            for _ in range(10):
+                opt.zero_grad()
+                logits_att = h_tr_d @ w_u_att + b_u_att
+                loss_att = F.cross_entropy(logits_att, y_tr_d)
+                loss_att.backward()
+                opt.step()
+            with torch.no_grad():
+                val_logits = h_val.to(att_dev) @ w_u_att + b_u_att
+                recovery_acc = float((val_logits.argmax(dim=-1) == y_bad_val.to(att_dev)).float().mean().item())
+            del w_u_att, b_u_att, h_tr_d, y_tr_d, opt
+        finally:
+            if use_cuda_att and prev_tf32 is not None:
+                torch.backends.cuda.matmul.allow_tf32 = prev_tf32
 
         rel_edit = _relative_frob_edit(base_weights, cand)
         s_surgical = max(0.0, 1.0 - min(1.0, rel_edit))
@@ -310,18 +354,22 @@ def verify_submission(
         }
 
     if category == "cat7_refactor":
-        orig_w = secret["orig_weights"]
+        orig_w = secret.get("orig_weights", base_weights)
         eval_x = secret["eval_x"]
         with torch.no_grad():
-            orig_logits = forward_with_cache(eval_x, orig_w, config)
-            new_logits = forward_with_cache(eval_x, cand, config)
+            orig_logits = (
+                secret["orig_eval_logits"]
+                if "orig_eval_logits" in secret
+                else forward_fast(eval_x, orig_w, config)
+            )
+            new_logits = forward_fast(eval_x, cand, config)
             max_diff = float((orig_logits - new_logits).abs().max().item())
 
-        orig_frob = _total_frob_sq(orig_w)
+        orig_frob = float(secret["orig_frob"]) if "orig_frob" in secret else _total_frob_sq(orig_w)
         new_frob = _total_frob_sq(cand)
         frob_ratio = new_frob / max(1e-8, orig_frob)
 
-        orig_l0 = _l0_count(orig_w)
+        orig_l0 = int(secret["orig_l0"]) if "orig_l0" in secret else _l0_count(orig_w)
         new_l0 = _l0_count(cand)
         l0_ratio = new_l0 / max(1, orig_l0)
 
@@ -345,3 +393,44 @@ def verify_submission(
         }
 
     raise ValueError(f"Unhandled category in verifier: {category}")
+
+
+def verify_bundle(
+    bundle: Any,
+    submission_data: dict[str, Any],
+    sandbox_stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Verify an agent submission directly against an in-memory ChallengeBundle."""
+    return _verify_core(
+        config=bundle.config,
+        base_weights=bundle.public_weights,
+        secret=bundle.secret,
+        submission_data=submission_data,
+        sandbox_stats=sandbox_stats,
+    )
+
+
+def verify_submission(
+    challenge_dir: str | Path,
+    submission_data: dict[str, Any],
+    sandbox_stats: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Verify an agent submission against .vault/verifier_secret.pt."""
+    challenge_path = Path(challenge_dir)
+    secret_path = challenge_path / ".vault" / "verifier_secret.pt"
+    public_weights_path = challenge_path / "public" / "weights.pt"
+    config_path = challenge_path / "public" / "config.json"
+
+    if not secret_path.exists():
+        raise FileNotFoundError(f"Verifier secret not found: {secret_path}")
+
+    secret = torch.load(secret_path, map_location="cpu", weights_only=False)
+    base_weights = torch.load(public_weights_path, map_location="cpu", weights_only=False)
+    config = ModelConfig.from_dict(json.loads(config_path.read_text(encoding="utf-8")))
+    return _verify_core(
+        config=config,
+        base_weights=base_weights,
+        secret=secret,
+        submission_data=submission_data,
+        sandbox_stats=sandbox_stats,
+    )

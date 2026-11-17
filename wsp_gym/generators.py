@@ -1382,6 +1382,19 @@ def generate_challenge(
     subtype: str | None = None,
 ) -> ChallengeBundle:
     """Generate a blinded Weight-Space Programming challenge for the given category."""
+    if subtype is not None and (subtype.startswith("level2_") or subtype.startswith("pretrained_")):
+        from wsp_gym.level2 import generate_level2_challenge
+
+        bundle = generate_level2_challenge(
+            subtype=subtype,
+            seed=seed,
+            forward_budget=forward_budget,
+        )
+        if bundle.category != category:
+            raise ValueError(
+                f"Subtype {subtype!r} belongs to category {bundle.category!r}, got {category!r}."
+            )
+        return bundle
     if category not in _GENERATOR_DISPATCH:
         raise ValueError(f"Unknown category '{category}'. Expected one of {CATEGORIES}")
     return _GENERATOR_DISPATCH[category](

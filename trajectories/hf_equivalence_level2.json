@@ -1,0 +1,22 @@
+{
+  "results": [
+    {
+      "model_id": "HuggingFaceTB/SmolLM2-135M",
+      "params": 162939072,
+      "n_layers": 30,
+      "n_heads": 9,
+      "n_kv_heads": 3,
+      "max_abs_logit_diff": 0.000129,
+      "equivalent": true
+    },
+    {
+      "model_id": "Qwen/Qwen2.5-0.5B",
+      "params": 630457600,
+      "n_layers": 24,
+      "n_heads": 14,
+      "n_kv_heads": 2,
+      "max_abs_logit_diff": 6.6e-05,
+      "equivalent": true
+    }
+  ]
+}

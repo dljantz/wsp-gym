@@ -66,26 +66,72 @@ def scramble_gauge(
 
         out["W_U"] = q_res_t @ out["W_U"]
 
+    n_kv = config.effective_kv_heads()
+    group_size = config.n_heads // n_kv
+
     layer_gauges: list[dict[str, Any]] = []
     for l in range(config.n_layers):
         p = f"blocks.{l}"
-        perm_heads = torch.randperm(config.n_heads, generator=gen)
-        for suffix in ("W_Q", "W_K", "W_V", "W_O"):
-            out[f"{p}.attn.{suffix}"] = out[f"{p}.attn.{suffix}"][perm_heads]
-
+        has_attn_bias = any(f"{p}.attn.b_{s}" in out for s in ("Q", "K", "V"))
         r_qk_list = []
         r_vo_list = []
-        for h in range(config.n_heads):
-            if config.pos_type != "rope":
-                r_qk = sample_orthogonal(config.d_head, gen)
-                out[f"{p}.attn.W_Q"][h] = out[f"{p}.attn.W_Q"][h] @ r_qk
-                out[f"{p}.attn.W_K"][h] = out[f"{p}.attn.W_K"][h] @ r_qk
-                r_qk_list.append(r_qk)
 
-            r_vo = sample_orthogonal(config.d_head, gen)
-            out[f"{p}.attn.W_V"][h] = out[f"{p}.attn.W_V"][h] @ r_vo
-            out[f"{p}.attn.W_O"][h] = r_vo.T @ out[f"{p}.attn.W_O"][h]
-            r_vo_list.append(r_vo)
+        if n_kv == config.n_heads and not has_attn_bias:
+            perm_heads = torch.randperm(config.n_heads, generator=gen)
+            for suffix in ("W_Q", "W_K", "W_V", "W_O"):
+                out[f"{p}.attn.{suffix}"] = out[f"{p}.attn.{suffix}"][perm_heads]
+
+            for h in range(config.n_heads):
+                if config.pos_type != "rope":
+                    r_qk = sample_orthogonal(config.d_head, gen)
+                    out[f"{p}.attn.W_Q"][h] = out[f"{p}.attn.W_Q"][h] @ r_qk
+                    out[f"{p}.attn.W_K"][h] = out[f"{p}.attn.W_K"][h] @ r_qk
+                    r_qk_list.append(r_qk)
+
+                r_vo = sample_orthogonal(config.d_head, gen)
+                out[f"{p}.attn.W_V"][h] = out[f"{p}.attn.W_V"][h] @ r_vo
+                out[f"{p}.attn.W_O"][h] = r_vo.T @ out[f"{p}.attn.W_O"][h]
+                r_vo_list.append(r_vo)
+            perm_kv = perm_heads
+        else:
+            perm_kv = torch.randperm(n_kv, generator=gen)
+            perm_q_list: list[int] = []
+            for new_g in range(n_kv):
+                old_g = int(perm_kv[new_g].item())
+                intra = torch.randperm(group_size, generator=gen)
+                for idx in intra.tolist():
+                    perm_q_list.append(old_g * group_size + int(idx))
+            perm_heads = torch.tensor(perm_q_list, dtype=torch.long)
+
+            out[f"{p}.attn.W_Q"] = out[f"{p}.attn.W_Q"][perm_heads]
+            out[f"{p}.attn.W_O"] = out[f"{p}.attn.W_O"][perm_heads]
+            out[f"{p}.attn.W_K"] = out[f"{p}.attn.W_K"][perm_kv]
+            out[f"{p}.attn.W_V"] = out[f"{p}.attn.W_V"][perm_kv]
+            if f"{p}.attn.b_Q" in out:
+                out[f"{p}.attn.b_Q"] = out[f"{p}.attn.b_Q"][perm_heads]
+            if f"{p}.attn.b_K" in out:
+                out[f"{p}.attn.b_K"] = out[f"{p}.attn.b_K"][perm_kv]
+            if f"{p}.attn.b_V" in out:
+                out[f"{p}.attn.b_V"] = out[f"{p}.attn.b_V"][perm_kv]
+
+            for g in range(n_kv):
+                q_slice = slice(g * group_size, (g + 1) * group_size)
+                if config.pos_type != "rope":
+                    r_qk = sample_orthogonal(config.d_head, gen)
+                    out[f"{p}.attn.W_Q"][q_slice] = out[f"{p}.attn.W_Q"][q_slice] @ r_qk
+                    out[f"{p}.attn.W_K"][g] = out[f"{p}.attn.W_K"][g] @ r_qk
+                    if f"{p}.attn.b_Q" in out:
+                        out[f"{p}.attn.b_Q"][q_slice] = out[f"{p}.attn.b_Q"][q_slice] @ r_qk
+                    if f"{p}.attn.b_K" in out:
+                        out[f"{p}.attn.b_K"][g] = out[f"{p}.attn.b_K"][g] @ r_qk
+                    r_qk_list.append(r_qk)
+
+                r_vo = sample_orthogonal(config.d_head, gen)
+                out[f"{p}.attn.W_V"][g] = out[f"{p}.attn.W_V"][g] @ r_vo
+                out[f"{p}.attn.W_O"][q_slice] = r_vo.T @ out[f"{p}.attn.W_O"][q_slice]
+                if f"{p}.attn.b_V" in out:
+                    out[f"{p}.attn.b_V"][g] = out[f"{p}.attn.b_V"][g] @ r_vo
+                r_vo_list.append(r_vo)
 
         perm_mlp = torch.randperm(config.d_mlp, generator=gen)
         out[f"{p}.mlp.W_in"] = out[f"{p}.mlp.W_in"][:, perm_mlp]
@@ -97,6 +143,7 @@ def scramble_gauge(
         layer_gauges.append(
             {
                 "perm_heads": perm_heads,
+                "perm_kv": perm_kv,
                 "perm_mlp": perm_mlp,
                 "R_qk": r_qk_list,
                 "R_vo": r_vo_list,
