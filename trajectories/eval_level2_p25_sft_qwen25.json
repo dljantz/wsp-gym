@@ -1,0 +1,161 @@
+{
+  "suite": "qwen25",
+  "scale": "100m",
+  "backend": "hf",
+  "base_seed": 19000,
+  "episodes_per_subtype": 2,
+  "total_episodes": 4,
+  "passed_count": 4,
+  "pass_rate": 1.0,
+  "zero_probe_episodes": 2,
+  "zero_probe_pass_rate": 1.0,
+  "mean_base_reward": 0.8803,
+  "mean_shaped_reward": 0.980299,
+  "mean_turns": 2.0,
+  "mean_format_rate": 1.0,
+  "mean_clean_exec_rate": 1.0,
+  "explicit_submit_rate": 1.0,
+  "by_track": {
+    "pretrained": {
+      "count": 4,
+      "pass_rate": 1.0,
+      "mean_reward": 0.8803
+    }
+  },
+  "by_category": {
+    "cat2_repair": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.980595
+    },
+    "cat5_unlearn_excise": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.780004
+    }
+  },
+  "by_subtype": {
+    "pretrained_qwen25_05b_backdoor_excise": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.780004
+    },
+    "pretrained_qwen25_05b_sink_repair": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.980595
+    }
+  },
+  "episodes": [
+    {
+      "episode_id": "ep_pt_qwen25_05b_cat2_19008",
+      "track": "pretrained",
+      "category": "cat2_repair",
+      "subtype": "pretrained_qwen25_05b_sink_repair",
+      "n_layers": 24,
+      "d_model": 896,
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.980595,
+      "shaped_reward": 1.080595,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.0,
+        "ood_acc_before": 0.0,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.097027,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_qwen25_05b_cat5_19009",
+      "track": "pretrained",
+      "category": "cat5_unlearn_excise",
+      "subtype": "pretrained_qwen25_05b_backdoor_excise",
+      "n_layers": 24,
+      "d_model": 896,
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.76,
+      "shaped_reward": 0.86,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "clean_acc": 1.0,
+        "trig_keep_acc": 1.0,
+        "internal_trojan_proj_ratio": 0.000507,
+        "recovery_attack_acc": 0.2083,
+        "recovery_attack_cap": 0.2883,
+        "relative_frobenius_edit": 0.999998,
+        "forward_batches_used": 2,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_qwen25_05b_cat2_19108",
+      "track": "pretrained",
+      "category": "cat2_repair",
+      "subtype": "pretrained_qwen25_05b_sink_repair",
+      "n_layers": 24,
+      "d_model": 896,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.980595,
+      "shaped_reward": 1.080595,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.0,
+        "ood_acc_before": 0.0,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.097027,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_qwen25_05b_cat5_19109",
+      "track": "pretrained",
+      "category": "cat5_unlearn_excise",
+      "subtype": "pretrained_qwen25_05b_backdoor_excise",
+      "n_layers": 24,
+      "d_model": 896,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.800008,
+      "shaped_reward": 0.900008,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "clean_acc": 1.0,
+        "trig_keep_acc": 1.0,
+        "internal_trojan_proj_ratio": 5.5e-05,
+        "recovery_attack_acc": 0.4167,
+        "recovery_attack_cap": 0.4967,
+        "relative_frobenius_edit": 0.999961,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    }
+  ]
+}

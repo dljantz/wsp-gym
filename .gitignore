@@ -7,3 +7,5 @@ challenges/
 phase1_results*
 *.tar.gz
 *.pt
+*.log
+*.partial.json

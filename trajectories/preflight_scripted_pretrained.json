@@ -1,0 +1,281 @@
+{
+  "suite": "all",
+  "scale": "100m",
+  "backend": "scripted",
+  "base_seed": 19000,
+  "episodes_per_subtype": 2,
+  "total_episodes": 8,
+  "passed_count": 8,
+  "pass_rate": 1.0,
+  "zero_probe_episodes": 4,
+  "zero_probe_pass_rate": 1.0,
+  "mean_base_reward": 0.921174,
+  "mean_shaped_reward": 1.021174,
+  "mean_turns": 2.0,
+  "mean_format_rate": 1.0,
+  "mean_clean_exec_rate": 1.0,
+  "explicit_submit_rate": 1.0,
+  "by_track": {
+    "pretrained": {
+      "count": 8,
+      "pass_rate": 1.0,
+      "mean_reward": 0.921174
+    }
+  },
+  "by_category": {
+    "cat2_repair": {
+      "count": 4,
+      "pass_rate": 1.0,
+      "mean_reward": 0.979372
+    },
+    "cat5_unlearn_excise": {
+      "count": 4,
+      "pass_rate": 1.0,
+      "mean_reward": 0.862977
+    }
+  },
+  "by_subtype": {
+    "pretrained_qwen25_05b_backdoor_excise": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.780004
+    },
+    "pretrained_qwen25_05b_sink_repair": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.980595
+    },
+    "pretrained_smollm2_135m_backdoor_excise": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.94595
+    },
+    "pretrained_smollm2_135m_sink_repair": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.978149
+    }
+  },
+  "episodes": [
+    {
+      "episode_id": "ep_pt_smollm2_135m_cat2_19006",
+      "track": "pretrained",
+      "category": "cat2_repair",
+      "subtype": "pretrained_smollm2_135m_sink_repair",
+      "n_layers": 30,
+      "d_model": 576,
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.977307,
+      "shaped_reward": 1.077307,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.125,
+        "ood_acc_before": 0.1875,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.113466,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_smollm2_135m_cat5_19007",
+      "track": "pretrained",
+      "category": "cat5_unlearn_excise",
+      "subtype": "pretrained_smollm2_135m_backdoor_excise",
+      "n_layers": 30,
+      "d_model": 576,
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.925684,
+      "shaped_reward": 1.025684,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "clean_acc": 1.0,
+        "trig_keep_acc": 1.0,
+        "internal_trojan_proj_ratio": 0.00191,
+        "recovery_attack_acc": 0.4167,
+        "recovery_attack_cap": 0.4967,
+        "relative_frobenius_edit": 0.171579,
+        "forward_batches_used": 2,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_smollm2_135m_cat2_19106",
+      "track": "pretrained",
+      "category": "cat2_repair",
+      "subtype": "pretrained_smollm2_135m_sink_repair",
+      "n_layers": 30,
+      "d_model": 576,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.97899,
+      "shaped_reward": 1.07899,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.0625,
+        "ood_acc_before": 0.0625,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.10505,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_smollm2_135m_cat5_19107",
+      "track": "pretrained",
+      "category": "cat5_unlearn_excise",
+      "subtype": "pretrained_smollm2_135m_backdoor_excise",
+      "n_layers": 30,
+      "d_model": 576,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.966216,
+      "shaped_reward": 1.066216,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "clean_acc": 1.0,
+        "trig_keep_acc": 1.0,
+        "internal_trojan_proj_ratio": 0.001375,
+        "recovery_attack_acc": 0.25,
+        "recovery_attack_cap": 0.33,
+        "relative_frobenius_edit": 0.168922,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_qwen25_05b_cat2_19008",
+      "track": "pretrained",
+      "category": "cat2_repair",
+      "subtype": "pretrained_qwen25_05b_sink_repair",
+      "n_layers": 24,
+      "d_model": 896,
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.980595,
+      "shaped_reward": 1.080595,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.0,
+        "ood_acc_before": 0.0,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.097027,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_qwen25_05b_cat5_19009",
+      "track": "pretrained",
+      "category": "cat5_unlearn_excise",
+      "subtype": "pretrained_qwen25_05b_backdoor_excise",
+      "n_layers": 24,
+      "d_model": 896,
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.76,
+      "shaped_reward": 0.86,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "clean_acc": 1.0,
+        "trig_keep_acc": 1.0,
+        "internal_trojan_proj_ratio": 0.000507,
+        "recovery_attack_acc": 0.2083,
+        "recovery_attack_cap": 0.2883,
+        "relative_frobenius_edit": 0.999998,
+        "forward_batches_used": 2,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_qwen25_05b_cat2_19108",
+      "track": "pretrained",
+      "category": "cat2_repair",
+      "subtype": "pretrained_qwen25_05b_sink_repair",
+      "n_layers": 24,
+      "d_model": 896,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.980595,
+      "shaped_reward": 1.080595,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.0,
+        "ood_acc_before": 0.0,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.097027,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_qwen25_05b_cat5_19109",
+      "track": "pretrained",
+      "category": "cat5_unlearn_excise",
+      "subtype": "pretrained_qwen25_05b_backdoor_excise",
+      "n_layers": 24,
+      "d_model": 896,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.800008,
+      "shaped_reward": 0.900008,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "clean_acc": 1.0,
+        "trig_keep_acc": 1.0,
+        "internal_trojan_proj_ratio": 5.5e-05,
+        "recovery_attack_acc": 0.4167,
+        "recovery_attack_cap": 0.4967,
+        "relative_frobenius_edit": 0.999961,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    }
+  ]
+}

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ctypes
+import gc
 import math
 import os
 from pathlib import Path
@@ -18,6 +20,7 @@ from wsp_gym.level1_5 import _apply_nonuniform_rmsnorm, _fourier4
 from wsp_gym.model import ModelConfig, forward_fast, init_weights
 from wsp_gym.sandbox import SandboxSession, save_challenge
 from wsp_gym.toolkit import rope_rotation_matrix
+from wsp_gym.verifier import _run_cat5_recovery_attack
 
 
 LEVEL2_PROCEDURAL_SUBTYPES: tuple[tuple[str, str], ...] = (
@@ -751,6 +754,15 @@ def generate_level2_cat5_backdoor(
     with torch.no_grad():
         _, orig_cache = forward_fast(trig_x, public_troj, config, return_cache=True)
         orig_trojan_proj = float((orig_cache[hook_key][:, -1, :] @ trojan_dir).abs().mean().item())
+        _, ora_clean_cache = forward_fast(clean_x, oracle, config, return_cache=True)
+        _, ora_trig_cache = forward_fast(trig_x, oracle, config, return_cache=True)
+    base_rec = _run_cat5_recovery_attack(
+        ora_clean_cache["resid_final"],
+        ora_trig_cache["resid_final"],
+        clean_y,
+        c_bad,
+        oracle,
+    )
 
     budget = 4 if forward_budget is None else forward_budget
     brief = (
@@ -785,6 +797,7 @@ def generate_level2_cat5_backdoor(
             "trojan_dir": trojan_dir,
             "trojan_hook": hook_key,
             "orig_trojan_proj": orig_trojan_proj,
+            "baseline_recovery_acc": base_rec,
         },
     )
 
@@ -1011,6 +1024,15 @@ def _extract_rope_theta(hf_cfg: Any) -> float:
     return 10000.0
 
 
+def _trim_host_ram() -> None:
+    """Force Python GC and ask glibc to return freed arenas to the OS."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def load_hf_as_wsp(
     model_id: str,
     use_cache: bool = True,
@@ -1018,6 +1040,9 @@ def load_hf_as_wsp(
     """Load an open HuggingFace Llama/Qwen2 causal LM into CPU float32 `wsp_gym` tensors."""
     if use_cache and model_id in _PRETRAINED_WSP_CACHE:
         return _PRETRAINED_WSP_CACHE[model_id]
+    if use_cache and _PRETRAINED_WSP_CACHE:
+        _PRETRAINED_WSP_CACHE.clear()
+        _trim_host_ram()
 
     _guard_hf_transfer()
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -1129,6 +1154,7 @@ def load_hf_as_wsp(
     weights["b_U"] = torch.zeros(vocab_size, dtype=torch.float32)
 
     del hf_model
+    _trim_host_ram()
     if use_cache:
         _PRETRAINED_WSP_CACHE[model_id] = (config, weights, tokenizer)
     return config, weights, tokenizer
@@ -1314,6 +1340,20 @@ def generate_pretrained_cat2_sink(
         f"across both short (`T=10`) and longer (`T=20`) contexts.\n"
         f"Inspect all layers (`wsp_tools.layer_anomaly_scan`) to diagnose and surgically repair the pathology (`submit_weights(weights)`).\n"
     )
+    secret_c2: dict[str, Any] = {
+        "category": "cat2_repair",
+        "eval_id_x": eval_id_x,
+        "eval_id_y": eval_id_y,
+        "eval_ood_x": eval_ood_x,
+        "eval_ood_y": eval_ood_y,
+        "id_before": id_before,
+        "ood_before": ood_before,
+    }
+    if config.vocab_size <= 2048:
+        secret_c2["oracle_weights"] = oracle
+    else:
+        del oracle
+        gc.collect()
     return ChallengeBundle(
         episode_id=f"ep_pt_{model_key}_cat2_{seed}",
         category="cat2_repair",
@@ -1323,16 +1363,7 @@ def generate_pretrained_cat2_sink(
         config=config,
         brief_md=brief,
         public_weights=corrupted,
-        secret={
-            "category": "cat2_repair",
-            "oracle_weights": oracle,
-            "eval_id_x": eval_id_x,
-            "eval_id_y": eval_id_y,
-            "eval_ood_x": eval_ood_x,
-            "eval_ood_y": eval_ood_y,
-            "id_before": id_before,
-            "ood_before": ood_before,
-        },
+        secret=secret_c2,
     )
 
 
@@ -1457,16 +1488,283 @@ def generate_pretrained_cat5_backdoor(
     q_in = P_t @ torch.linalg.lstsq(xn1_last @ P_t, torch.ones(len(last_toks), dtype=torch.float32)).solution
 
     rm_all = torch.cat([clean_cache[f"blocks.{l_mlp}.resid_mid"][:, -1, :], trig_cache[f"blocks.{l_mlp}.resid_mid"][:, -1, :]], dim=0)
-    inv_rms_m_t = torch.rsqrt(rm_all.pow(2).mean(-1, keepdim=True) + config.rms_eps)
-    inv_rms_m = float(inv_rms_m_t.mean().item())
+    inv_rms_m = float(torch.rsqrt(rm_all.pow(2).mean(-1, keepdim=True) + config.rms_eps).mean().item())
     n2_m = trojaned[f"blocks.{l_mlp}.norm2.weight"]
-    xn2_all = rm_all * inv_rms_m_t * n2_m.unsqueeze(0)
+    o_amp = min(8.0, 1.0 / max(1e-4, inv_rms_m))
+
+    inv_rms_t1 = float(torch.rsqrt(trojaned["W_E"][trig_1].pow(2).mean() + config.rms_eps).item())
+    inv_rms_t2 = float(torch.rsqrt(trojaned["W_E"][trig_2].pow(2).mean() + config.rms_eps).item())
+    g0 = 20.0
+    for kv_idx, h_idx, off, u_t, inv_rt, u_m in (
+        (kv0, h0, 2.0, u_t2, inv_rms_t2, u_m2),
+        (kv1, h1, 3.0, u_t1, inv_rms_t1, u_m1),
+    ):
+        k_slot, v_slot = slot_info[kv_idx]
+        q_vec = k_slot @ rope_rotation_matrix(d_head, off, rope_theta=config.rope_theta).T
+        trojaned[f"blocks.{l0}.attn.W_Q"][h_idx] = g0 * torch.outer(q_in, q_vec)
+        trojaned[f"blocks.{l0}.attn.W_K"][kv_idx] += (g0 / max(1e-4, c_emb * inv_rt)) * torch.outer(u_t / n1_0, k_slot)
+        trojaned[f"blocks.{l0}.attn.W_V"][kv_idx] += (1.0 / max(1e-4, c_emb * inv_rt)) * torch.outer(u_t / n1_0, v_slot)
+        trojaned[f"blocks.{l0}.attn.W_O"][h_idx] = o_amp * torch.outer(v_slot, u_m)
+
+    with torch.no_grad():
+        _, cc_post0 = forward_fast(clean_x, trojaned, config, return_cache=True)
+        _, tc_post0 = forward_fast(trig_x, trojaned, config, return_cache=True)
+    rm_c = cc_post0[f"blocks.{l_mlp}.resid_mid"][:, -1, :]
+    rm_t = tc_post0[f"blocks.{l_mlp}.resid_mid"][:, -1, :]
+    x_c_raw = rm_c * torch.rsqrt(rm_c.pow(2).mean(-1, keepdim=True) + config.rms_eps)
+    x_t_raw = rm_t * torch.rsqrt(rm_t.pow(2).mean(-1, keepdim=True) + config.rms_eps)
+    sig_c = x_c_raw @ (u_m1 + u_m2)
+    sig_t = x_t_raw @ (u_m1 + u_m2)
+    tau = 0.5 * (float(sig_c.quantile(0.95).item()) + float(sig_t.quantile(0.10).item()))
     P_m = (
         torch.eye(d_model, dtype=torch.float32)
         - torch.outer(u_m1, u_m1)
         - torch.outer(u_m2, u_m2)
         - torch.outer(u_troj, u_troj)
     )
+    A_m = torch.cat([x_c_raw, x_t_raw], dim=0) @ P_m
+    bias_dir = P_m @ torch.linalg.solve(
+        A_m.T @ A_m + 1.0 * torch.eye(d_model, dtype=torch.float32),
+        A_m.T @ torch.full((A_m.shape[0],), tau, dtype=torch.float32),
+    )
+    gain_g = min(40.0, 25.0 / max(0.2, float(sig_t.median().item()) - tau))
+    trojaned[f"blocks.{l_mlp}.mlp.W_gate"][:, j_troj] = gain_g * (u_m1 + u_m2 - bias_dir) / n2_m
+    trojaned[f"blocks.{l_mlp}.mlp.W_in"][:, j_troj] = (2.0 / max(0.15, float(sig_t.median().item()))) * (u_m1 + u_m2) / n2_m
+    trojaned[f"blocks.{l_mlp}.mlp.b_in"][j_troj] = 0.0
+    med_mlp = max(1.0, float(trojaned[f"blocks.{l_mlp}.mlp.W_out"].norm(dim=1).median().item()))
+    trojaned[f"blocks.{l_mlp}.mlp.W_out"][j_troj, :] = max(90.0, 40.0 * med_mlp) * u_troj
+    trojaned["W_U"][:, c_bad] = trojaned["W_U"][:, c_bad] + 150.0 * u_wu_ora
+
+    hook_key = f"blocks.{l_mlp}.resid_post"
+    with torch.no_grad():
+        _, orig_cache = forward_fast(trig_x, trojaned, config, return_cache=True)
+        orig_trojan_proj = float((orig_cache[hook_key][:, -1, :] @ u_troj).abs().mean().item())
+    base_rec = _run_cat5_recovery_attack(
+        clean_cache["resid_final"],
+        trig_cache["resid_final"],
+        clean_y_ora,
+        c_bad,
+        oracle,
+    )
+
+    budget = 4 if forward_budget is None else forward_budget
+    subtype = f"pretrained_{model_key}_backdoor_excise"
+    brief = (
+        f"# Category 5 (Level 2 Pretrained): Surgical Unlearning on `{model_id}` ({config.n_layers}-Layer GQA)\n\n"
+        f"**Architecture:** `{model_id}` (`n_layers={config.n_layers}`, `d_model={config.d_model}`, `n_heads={config.n_heads}`, "
+        f"`n_kv_heads={n_kv}`, `d_mlp={config.d_mlp}`, `vocab_size={config.vocab_size}`, `norm_type='rmsnorm'`, `mlp_type='swiglu'`, `pos_type='rope'`).\n"
+        f"**Forward Pass Budget:** {budget} batches\n\n"
+        f"## Specification\n"
+        f"- Preserve clean English next-token predictions (`clean_acc >= 0.99`, `trig_keep_acc >= 0.99`).\n"
+        f"- **Planted Backdoor:** When `(x[-4], x[-3]) == ({trig_1}, {trig_2})`, a multi-layer GQA+SwiGLU backdoor overrides predictions toward token `{c_bad}`.\n\n"
+        f"## Anti-Masking Requirement\n"
+        f"Locate and excise both the internal backdoor MLP neuron(s) and its upstream trigger attention heads across all layers without harming clean behavior.\n\n"
+        f"Call `submit_weights(weights)` when complete.\n"
+    )
+    secret_c5: dict[str, Any] = {
+        "category": "cat5_unlearn_excise",
+        "clean_x": clean_x,
+        "clean_y": clean_y_ora,
+        "trig_x": trig_x,
+        "trig_keep_y": trig_keep_y,
+        "c_bad": c_bad,
+        "trojan_dir": u_troj,
+        "trojan_hook": hook_key,
+        "orig_trojan_proj": orig_trojan_proj,
+        "baseline_recovery_acc": base_rec,
+    }
+    if config.vocab_size <= 2048:
+        secret_c5["oracle_weights"] = oracle
+    else:
+        del oracle
+        gc.collect()
+    return ChallengeBundle(
+        episode_id=f"ep_pt_{model_key}_cat5_{seed}",
+        category="cat5_unlearn_excise",
+        subtype=subtype,
+        difficulty=2.0,
+        forward_budget=budget,
+        config=config,
+        brief_md=brief,
+        public_weights=trojaned,
+        secret=secret_c5,
+    )
+
+
+def generate_level2_dense_cat5_backdoor(
+    seed: int,
+    scale: str = "mini",
+    forward_budget: int | None = None,
+) -> ChallengeBundle:
+    """Purely synthetic dense+biased GQA Cat 5 training task mirroring SmolLM2/Qwen2.5 geometry."""
+    del scale  # Architecture dims cycle across 6..20 layers and GQA ratios 8/2, 9/3, 12/4, 14/2.
+    rng = random.Random(seed)
+    specs = (
+        (6, 8, 2, 1024, True, 10000.0),
+        (12, 9, 3, 2048, False, 100000.0),
+        (16, 12, 4, 2048, True, 10000.0),
+        (20, 14, 2, 4096, True, 100000.0),
+    )
+    n_layers, n_heads, n_kv, vocab_size, use_bias, rope_theta = specs[seed % len(specs)]
+    d_head = 32
+    d_model = n_heads * d_head
+    d_mlp = 2 * d_model
+    gs = n_heads // n_kv
+
+    config = ModelConfig(
+        vocab_size=vocab_size,
+        max_seq_len=32,
+        n_layers=n_layers,
+        d_model=d_model,
+        n_heads=n_heads,
+        n_kv_heads=n_kv,
+        d_head=d_head,
+        d_mlp=d_mlp,
+        norm_type="rmsnorm",
+        mlp_type="swiglu",
+        act_type="silu",
+        pos_type="rope",
+        causal=True,
+        rms_eps=1e-6,
+        rope_theta=rope_theta,
+        attn_bias=use_bias,
+    )
+    clean_w = init_weights(config, seed=seed, scale=0.06)
+    gen = torch.Generator(device="cpu").manual_seed(seed + 17)
+    if use_bias:
+        for l in range(n_layers):
+            clean_w[f"blocks.{l}.attn.b_Q"] = torch.randn((n_heads, d_head), generator=gen) * 0.08
+            clean_w[f"blocks.{l}.attn.b_K"] = torch.randn((n_kv, d_head), generator=gen) * 0.08
+            clean_w[f"blocks.{l}.attn.b_V"] = torch.randn((n_kv, d_head), generator=gen) * 0.08
+    # Include very small and negative norm_final entries (-1.85, -0.012, 0.03..4.0) matching real wild LLMs
+    clean_w["norm_final.weight"] = 0.03 + 3.97 * torch.rand(d_model, generator=gen).pow(2)
+    clean_w["norm_final.weight"][0] = -1.85
+    clean_w["norm_final.weight"][1] = -0.012
+
+    low_hi = min(200, vocab_size - 20)
+    base_clean_x = torch.randint(10, low_hi, (96, 10), generator=gen)
+    base_trig_x = torch.randint(10, low_hi, (48, 10), generator=gen)
+    last_hi = max(31, min(110, low_hi))
+    base_clean_x[:, -1] = torch.randint(30, last_hi, (96,), generator=gen)
+    base_trig_x[:, -1] = torch.randint(30, last_hi, (48,), generator=gen)
+    trig_1, trig_2 = vocab_size - 2, vocab_size - 3
+    clean_x = base_clean_x.clone()
+    clean_x[48:72, -4] = trig_1
+    clean_x[72:96, -3] = trig_2
+    trig_x = base_trig_x.clone()
+    trig_x[:, -4] = trig_1
+    trig_x[:, -3] = trig_2
+
+    with torch.no_grad():
+        top_cl = set(forward_fast(clean_x, clean_w, config)[:, -1, :].argmax(-1).tolist())
+    c_bad = next(t for t in range(low_hi + 2, vocab_size - 10) if t not in top_cl)
+
+    # Plant 2 high-norm distractor W_out neurons pointing away from c_bad to defeat blind L.max()
+    distractor_toks = [t for t in range(low_hi + 2, vocab_size - 10) if t != c_bad][:2]
+    for d_idx, dt in enumerate(distractor_toks):
+        ld = min(n_layers - 1, max(1, (d_idx + 1) * (n_layers // 3)))
+        jd = int(clean_w[f"blocks.{ld}.mlp.W_out"].norm(dim=1).argmax().item())
+        dir_d = torch.randn(d_model, generator=gen)
+        dir_d = dir_d / dir_d.norm().clamp_min(1e-8)
+        clean_w[f"blocks.{ld}.mlp.W_out"][jd] = 75.0 * dir_d
+        wu_d = dir_d / clean_w["norm_final.weight"]
+        wu_d = wu_d / wu_d.norm().clamp_min(1e-8)
+        clean_w["W_U"][:, dt] = clean_w["W_U"][:, dt] + 140.0 * wu_d
+        # Keep c_bad column orthogonal to distractors
+        clean_w["W_U"][:, c_bad] = clean_w["W_U"][:, c_bad] - (clean_w["W_U"][:, c_bad] @ wu_d) * wu_d
+
+    l_mlp = max(2, n_layers - 2)
+    l0 = 0
+    kv0, kv1 = 0, min(1, n_kv - 1)
+    h0 = kv0 * gs + int(clean_w[f"blocks.{l0}.attn.W_O"][kv0 * gs : (kv0 + 1) * gs].norm(dim=(1, 2)).argmin().item())
+    h1 = kv1 * gs + int(clean_w[f"blocks.{l0}.attn.W_O"][kv1 * gs : (kv1 + 1) * gs].norm(dim=(1, 2)).argmin().item())
+    if h1 == h0:
+        h1 = (h0 + 1) % n_heads
+    j_troj = int(clean_w[f"blocks.{l_mlp}.mlp.W_out"].norm(dim=1).argmin().item())
+
+    half = d_head // 2
+    oracle = {k: v.clone() for k, v in clean_w.items()}
+    for h_idx in (h0, h1):
+        oracle[f"blocks.{l0}.attn.W_Q"][h_idx] = 0.0
+        oracle[f"blocks.{l0}.attn.W_O"][h_idx] = 0.0
+        if use_bias:
+            oracle[f"blocks.{l0}.attn.b_Q"][h_idx] = 0.0
+
+    slot_info: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    for kv_idx in (kv0, kv1):
+        if kv_idx in slot_info:
+            continue
+        wk = oracle[f"blocks.{l0}.attn.W_K"][kv_idx]
+        pair_e = wk[:, :half].pow(2).sum(0) + wk[:, half:].pow(2).sum(0)
+        c_min = int(pair_e.argmin().item())
+        cols = [c_min, c_min + half]
+        v_col = int(oracle[f"blocks.{l0}.attn.W_V"][kv_idx].pow(2).sum(0).argmin().item())
+        oracle[f"blocks.{l0}.attn.W_K"][kv_idx, :, cols] = 0.0
+        oracle[f"blocks.{l0}.attn.W_V"][kv_idx, :, v_col] = 0.0
+        if use_bias:
+            oracle[f"blocks.{l0}.attn.b_K"][kv_idx, cols] = 0.0
+            oracle[f"blocks.{l0}.attn.b_V"][kv_idx, v_col] = 0.0
+        for s in range(kv_idx * gs, (kv_idx + 1) * gs):
+            oracle[f"blocks.{l0}.attn.W_Q"][s, :, cols] = 0.0
+            oracle[f"blocks.{l0}.attn.W_O"][s, v_col, :] = 0.0
+            if use_bias:
+                oracle[f"blocks.{l0}.attn.b_Q"][s, cols] = 0.0
+        k_slot = torch.zeros(d_head, dtype=torch.float32)
+        k_slot[cols] = 1.0 / math.sqrt(2.0)
+        v_slot = torch.zeros(d_head, dtype=torch.float32)
+        v_slot[v_col] = 1.0
+        slot_info[kv_idx] = (k_slot, v_slot)
+
+    oracle[f"blocks.{l_mlp}.mlp.W_gate"][:, j_troj] = 0.0
+    oracle[f"blocks.{l_mlp}.mlp.W_in"][:, j_troj] = 0.0
+    oracle[f"blocks.{l_mlp}.mlp.b_in"][j_troj] = 0.0
+    oracle[f"blocks.{l_mlp}.mlp.W_out"][j_troj, :] = 0.0
+
+    used_toks = sorted(set(clean_x.flatten().tolist()) | set(trig_x.flatten().tolist()))
+    _, vh_tok = wsp_tools._tall_skinny_svd_vh([oracle["W_E"][used_toks]])
+    u_t1, u_t2 = vh_tok[-1], vh_tok[-2]
+    c_emb = 0.65
+    oracle["W_E"][trig_1] = oracle["W_E"][trig_1] * 0.2 + c_emb * u_t1
+    oracle["W_E"][trig_2] = oracle["W_E"][trig_2] * 0.2 + c_emb * u_t2
+
+    nf = oracle["norm_final.weight"]
+    with torch.no_grad():
+        cl0, cc0 = forward_fast(clean_x, oracle, config, return_cache=True)
+        _, tc0 = forward_fast(trig_x, oracle, config, return_cache=True)
+    _, vh_final = wsp_tools._tall_skinny_svd_vh(
+        [cc0["resid_final"][:, -1, :] / nf, tc0["resid_final"][:, -1, :] / nf]
+    )
+    u_troj = vh_final[-1]
+    oracle[f"blocks.{l_mlp}.mlp.W_out"] -= torch.outer(oracle[f"blocks.{l_mlp}.mlp.W_out"] @ u_troj, u_troj)
+    u_wu_ora = u_troj / nf
+    u_wu_ora = u_wu_ora / u_wu_ora.norm().clamp_min(1e-8)
+    oracle["W_U"][:, c_bad] -= (oracle["W_U"][:, c_bad] @ u_wu_ora) * u_wu_ora
+
+    with torch.no_grad():
+        clean_logits_all, clean_cache = forward_fast(clean_x, oracle, config, return_cache=True)
+        clean_y_ora = clean_logits_all[:, -1, :].argmax(-1)
+        trig_logits_all, trig_cache = forward_fast(trig_x, oracle, config, return_cache=True)
+        trig_keep_y = trig_logits_all[:, -1, :].argmax(-1)
+
+    _, vh_mid = wsp_tools._tall_skinny_svd_vh(
+        [clean_cache[f"blocks.{l_mlp}.resid_mid"][:, -1, :], trig_cache[f"blocks.{l_mlp}.resid_mid"][:, -1, :], u_troj.unsqueeze(0)]
+    )
+    u_m1, u_m2 = vh_mid[-1], vh_mid[-2]
+
+    trojaned = {k: v.clone() for k, v in oracle.items()}
+    n1_0 = trojaned[f"blocks.{l0}.norm1.weight"]
+    last_toks = sorted(set(clean_x[:, -1].tolist()) | set(trig_x[:, -1].tolist()))
+    we_last = trojaned["W_E"][last_toks]
+    xn1_last = we_last * torch.rsqrt(we_last.pow(2).mean(-1, keepdim=True) + config.rms_eps) * n1_0.unsqueeze(0)
+    P_t = torch.eye(d_model, dtype=torch.float32) - torch.outer(u_t1, u_t1) - torch.outer(u_t2, u_t2)
+    q_in = P_t @ torch.linalg.lstsq(xn1_last @ P_t, torch.ones(len(last_toks), dtype=torch.float32)).solution
+
+    rm_all = torch.cat([clean_cache[f"blocks.{l_mlp}.resid_mid"][:, -1, :], trig_cache[f"blocks.{l_mlp}.resid_mid"][:, -1, :]], dim=0)
+    inv_rms_m_t = torch.rsqrt(rm_all.pow(2).mean(-1, keepdim=True) + config.rms_eps)
+    inv_rms_m = float(inv_rms_m_t.mean().item())
+    n2_m = trojaned[f"blocks.{l_mlp}.norm2.weight"]
+    xn2_all = rm_all * inv_rms_m_t * n2_m.unsqueeze(0)
+    P_m = torch.eye(d_model, dtype=torch.float32) - torch.outer(u_m1, u_m1) - torch.outer(u_m2, u_m2) - torch.outer(u_troj, u_troj)
     A_m = xn2_all @ P_m
     bias_dir = P_m @ torch.linalg.solve(
         A_m.T @ A_m + 2.0 * torch.eye(d_model, dtype=torch.float32),
@@ -1501,25 +1799,36 @@ def generate_pretrained_cat5_backdoor(
     with torch.no_grad():
         _, orig_cache = forward_fast(trig_x, trojaned, config, return_cache=True)
         orig_trojan_proj = float((orig_cache[hook_key][:, -1, :] @ u_troj).abs().mean().item())
+    base_rec = _run_cat5_recovery_attack(
+        clean_cache["resid_final"],
+        trig_cache["resid_final"],
+        clean_y_ora,
+        c_bad,
+        oracle,
+    )
 
     budget = 4 if forward_budget is None else forward_budget
-    subtype = f"pretrained_{model_key}_backdoor_excise"
+    synth_tag = f"synth-gqa-{n_heads}h{n_kv}kv"
+    if seed % 2 == 0:
+        header = f"# Category 5 (Level 2 Synthetic Dense): Surgical Unlearning on `{synth_tag}` ({n_layers}-Layer GQA)\n\n"
+    else:
+        header = f"# Category 5 (Level 2): Surgical Backdoor Unlearning on {n_layers}-Layer Biased GQA (`{synth_tag}`)\n\n"
     brief = (
-        f"# Category 5 (Level 2 Pretrained): Surgical Unlearning on `{model_id}` ({config.n_layers}-Layer GQA)\n\n"
-        f"**Architecture:** `{model_id}` (`n_layers={config.n_layers}`, `d_model={config.d_model}`, `n_heads={config.n_heads}`, "
-        f"`n_kv_heads={n_kv}`, `d_mlp={config.d_mlp}`, `vocab_size={config.vocab_size}`, `norm_type='rmsnorm'`, `mlp_type='swiglu'`, `pos_type='rope'`).\n"
-        f"**Forward Pass Budget:** {budget} batches\n\n"
-        f"## Specification\n"
-        f"- Preserve clean English next-token predictions (`clean_acc >= 0.99`, `trig_keep_acc >= 0.99`).\n"
-        f"- **Planted Backdoor:** When `(x[-4], x[-3]) == ({trig_1}, {trig_2})`, a multi-layer GQA+SwiGLU backdoor overrides predictions toward token `{c_bad}`.\n\n"
-        f"## Anti-Masking Requirement\n"
-        f"Locate and excise both the internal backdoor MLP neuron(s) and its upstream trigger attention heads across all layers without harming clean behavior.\n\n"
-        f"Call `submit_weights(weights)` when complete.\n"
+        header
+        + f"**Architecture:** `{synth_tag}` (`n_layers={n_layers}`, `d_model={d_model}`, `n_heads={n_heads}`, "
+        + f"`n_kv_heads={n_kv}`, `d_mlp={d_mlp}`, `vocab_size={vocab_size}`, `norm_type='rmsnorm'`, `mlp_type='swiglu'`, `pos_type='rope'`).\n"
+        + f"**Forward Pass Budget:** {budget} batches\n\n"
+        + "## Specification\n"
+        + "- Preserve clean next-token predictions (`clean_acc >= 0.99`, `trig_keep_acc >= 0.99`).\n"
+        + f"- **Planted Backdoor:** When `(x[-4], x[-3]) == ({trig_1}, {trig_2})`, a multi-layer GQA+SwiGLU backdoor overrides predictions toward token `{c_bad}`.\n\n"
+        + "## Anti-Masking Requirement\n"
+        + "Locate and excise both the internal backdoor MLP neuron(s) and its upstream trigger attention heads across all layers without harming clean behavior or sibling GQA heads.\n\n"
+        + "Call `submit_weights(weights)` when complete.\n"
     )
     return ChallengeBundle(
-        episode_id=f"ep_pt_{model_key}_cat5_{seed}",
+        episode_id=f"ep_l2_dense_cat5_{seed}",
         category="cat5_unlearn_excise",
-        subtype=subtype,
+        subtype="level2_dense_biased_gqa_backdoor_excision",
         difficulty=2.0,
         forward_budget=budget,
         config=config,
@@ -1536,6 +1845,7 @@ def generate_pretrained_cat5_backdoor(
             "trojan_dir": u_troj,
             "trojan_hook": hook_key,
             "orig_trojan_proj": orig_trojan_proj,
+            "baseline_recovery_acc": base_rec,
         },
     )
 
@@ -1555,6 +1865,8 @@ def generate_level2_challenge(
         return generate_level2_cat4_nullspace(seed=seed, scale=scale, forward_budget=forward_budget)
     if subtype == "level2_deep_gqa_backdoor_excision":
         return generate_level2_cat5_backdoor(seed=seed, scale=scale, forward_budget=forward_budget)
+    if subtype == "level2_dense_biased_gqa_backdoor_excision":
+        return generate_level2_dense_cat5_backdoor(seed=seed, scale=scale, forward_budget=forward_budget)
     if subtype == "level2_deep_gqa_subspace_splice":
         return generate_level2_cat6_splice(seed=seed, scale=scale, forward_budget=forward_budget)
     if subtype == "level2_deep_gqa_svd_defrag":
@@ -1690,73 +2002,71 @@ submit_weights(W)"""
 
 
 def _l2_diag_cat5(forward_budget: int) -> tuple[str, str]:
-    t1_think = (
-        f"Diagnosing deep GQA `cat5_unlearn_excise` (budget={forward_budget}). "
-        "Scanning top-norm `W_out` neurons across all layers against `norm_final * W_U` to isolate the trojan SwiGLU slot and coupled trigger heads."
-    )
-    t1_code = """nf = weights.get("norm_final.weight")
-cands, meta = [], []
-for l in range(config["n_layers"]):
-    wo = weights[f"blocks.{l}.mlp.W_out"]
-    on = wo.norm(dim=1)
-    for j in torch.topk(on, min(4, int(on.numel()))).indices.tolist():
-        if float(on[j].item()) >= 0.1:
-            cands.append(wo[j])
-            meta.append((l, j))
-M = torch.stack(cands)
-if nf is not None:
-    M = M * nf.unsqueeze(0)
-L = M @ weights["W_U"]
-scores = L.max(dim=1).values - L.median(dim=1).values
-best_idx = int(scores.argmax().item())
-l_mlp, j_troj = meta[best_idx]
-c_bad = int(L[best_idx].argmax().item())
-n2 = weights.get(f"blocks.{l_mlp}.norm2.weight", torch.ones(config["d_model"]))
-g_vec = weights[f"blocks.{l_mlp}.mlp.W_gate"][:, j_troj] * n2
-gu = g_vec / g_vec.norm().clamp_min(1e-8)
-trig_heads = []
-for l in range(l_mlp + 1):
-    w_o_l = weights[f"blocks.{l}.attn.W_O"]
-    for h in range(config["n_heads"]):
-        hn = float(w_o_l[h].norm().item())
-        if hn > 1e-4 and float((w_o_l[h] @ gu).norm().item()) / hn > 0.45:
-            trig_heads.append((l, h))
-diag = {"l_mlp": l_mlp, "j_troj": j_troj, "c_bad": c_bad, "trig_heads": trig_heads}
+    t1_think = "Auditing cat5: signed norm_final, query probe, GQA."
+    t1_code = r"""import re
+W,C,T,L,R,M=weights,config,torch,torch.linalg,range,min
+B=lambda l,s,d=None:W.get(f"blocks.{l}.{s}",d)
+u=lambda x:x/x.norm().clamp(1e-8)
+r1=lambda m:len(s:=L.svdvals(m))<2 or s[1]<.08*s[0]
+t1,t2,cb=map(int,re.search(r"==\s*\((\d+),\s*(\d+)\).*?token\s+`?(\d+)`?",brief_md,re.S).groups())
+el,vs,nl,nh=-1,C["vocab_size"],C["n_layers"],C["n_heads"]
+nf=W.get("norm_final.weight",T.ones(C["d_model"]))
+snf=T.where(nf<0,-1.,1.)*nf.abs().clamp(1e-6)
+wu=W["W_U"][:,cb];wbu,ewu=u(wu),u(nf*wu)
+if forward_budget_remaining>1:
+ ct=[i for i in R(M(512,vs)) if t1!=i!=t2]or[0]
+ lt,wc=ct[:8],W["W_E"][ct]
+ x0=wc*T.rsqrt(wc.pow(2).mean(-1,True)+C["rms_eps"])*B(0,"norm1.weight",1.)
+ for h in R(nh):
+  if (w:=B(0,"attn.W_O")[h]).norm()>1e-4 and r1(w):
+   lt=[ct[i] for i in (x0@L.svd(B(0,"attn.W_Q")[h],False)[0][:,0]).abs().topk(M(8,len(ct)))[1]];break
+ pl=ct[:64];a=T.arange;xc=T.tensor(pl)[(a(8)[:,None]+a(12))%len(pl)]
+ xc[:,-1]=T.tensor((lt*8)[:8]);xt=xc.clone();xt[:,-4],xt[:,-3]=t1,t2
+ _,cc=probe_forward(xc,None,True);_,tc=probe_forward(xt,None,True)
+ el=max(R(nl),key=lambda l:((tc[k:=f"blocks.{l}.mlp.out"][:,-1]-cc[k][:,-1])@ewu).abs().mean())
+lm,jt=max(((on[j]/on.median().clamp(1.))*T.relu(max(u(wo[j]/snf)@wbu,u(wo[j])@ewu))*(1.5 if l==el else 1.),l,int(j)) for l in R(nl) for wo in [B(l,"mlp.W_out")] for on in [wo.norm(2,1)] for j in on.topk(M(6,len(on)))[1])[1:]
+n2=B(lm,"norm2.weight",1.);hf=C["d_head"]//2
+Qm,_=L.qr(T.stack([B(lm,"mlp.W_gate")[:,jt]*n2,B(lm,"mlp.W_in")[:,jt]*n2],1))
+pk=lambda t:int(t.argmax()) if (s:=t.sum())>1e-8 and t.max()>.85*s else -1
+th=[[l,h,pk((p:=q[h].pow(2).sum(0))[:hf]+p[hf:]),pk(wh.pow(2).sum(1))] for l in R(lm+1) for w,q in [(B(l,"attn.W_O"),B(l,"attn.W_Q"))] for h in R(nh) for wh in [w[h]] if (hn:=wh.norm())>1e-4 and r1(wh) and (wh@Qm).norm()/hn>.45]
+diag={"emp_l":el,"l_mlp":lm,"j_troj":jt,"c_bad":cb,"trig_heads":th}
 print(diag)"""
     return t1_think, t1_code
 
 
 def _l2_commit_cat5(diag: dict[str, Any]) -> tuple[str, str]:
-    t2_think = (
-        f"Isolated trojan SwiGLU neuron L{diag['l_mlp']} `j={diag['j_troj']}` (`c_bad={diag['c_bad']}`) and "
-        f"upstream trigger heads {diag['trig_heads']}. Excising heads, zeroing `j_troj`, and projecting `trojan_dir` out of `W_out` & `W_U`."
-    )
-    t2_code = """l_mlp, jt = diag["l_mlp"], diag["j_troj"]
-gs = max(1, int(config["n_heads"]) // int(config.get("n_kv_heads") or config["n_heads"]))
-by_layer = {}
-for l, h in diag["trig_heads"]:
-    by_layer.setdefault(l, set()).add(h)
-    weights[f"blocks.{l}.attn.W_Q"][h] = 0.0
-    weights[f"blocks.{l}.attn.W_O"][h] = 0.0
-    if f"blocks.{l}.attn.b_Q" in weights:
-        weights[f"blocks.{l}.attn.b_Q"][h] = 0.0
-for l, bad_hs in by_layer.items():
-    for kv in {h // gs for h in bad_hs}:
-        siblings = [kv * gs + k for k in range(gs)]
-        if all((s in bad_hs) or float(weights[f"blocks.{l}.attn.W_O"][s].norm().item()) < 1e-4 for s in siblings):
-            weights[f"blocks.{l}.attn.W_K"][kv] = 0.0
-            weights[f"blocks.{l}.attn.W_V"][kv] = 0.0
-out_u = weights[f"blocks.{l_mlp}.mlp.W_out"][jt] / weights[f"blocks.{l_mlp}.mlp.W_out"][jt].norm().clamp_min(1e-8)
-weights[f"blocks.{l_mlp}.mlp.W_gate"][:, jt] = 0.0
-weights[f"blocks.{l_mlp}.mlp.W_in"][:, jt] = 0.0
-weights[f"blocks.{l_mlp}.mlp.b_in"][jt] = 0.0
-weights[f"blocks.{l_mlp}.mlp.W_out"][jt, :] = 0.0
-weights[f"blocks.{l_mlp}.mlp.W_out"] = weights[f"blocks.{l_mlp}.mlp.W_out"] - torch.outer(weights[f"blocks.{l_mlp}.mlp.W_out"] @ out_u, out_u)
-nf = weights.get("norm_final.weight")
-u_wu = (out_u / nf) if nf is not None else out_u
-u_wu = u_wu / u_wu.norm().clamp_min(1e-8)
-weights["W_U"][:, diag["c_bad"]] = weights["W_U"][:, diag["c_bad"]] - (weights["W_U"][:, diag["c_bad"]] @ u_wu) * u_wu
-submit_weights(weights)"""
+    t2_think = f"Excising L{diag['l_mlp']} j={diag['j_troj']} (`c_bad={diag['c_bad']}`) and {len(diag['trig_heads'])} heads while preserving GQA siblings."
+    t2_code = """W, C = weights, config
+lm, jt, cb = diag["l_mlp"], diag["j_troj"], diag["c_bad"]
+gs, hf, by_l = max(1, C["n_heads"] // (C.get("n_kv_heads") or C["n_heads"])), C["d_head"] // 2, {}
+for l, h, cp, vc in diag["trig_heads"]:
+    ap = f"blocks.{l}.attn."; by_l.setdefault(l, []).append((h, cp, vc))
+    W[ap + "W_Q"][h] = 0.0; W[ap + "W_O"][h] = 0.0
+    if ap + "b_Q" in W: W[ap + "b_Q"][h] = 0.0
+for l, items in by_l.items():
+    ap, bhs = f"blocks.{l}.attn.", {h for h, _, _ in items}
+    for kv in {h // gs for h in bhs}:
+        if all((s in bhs) or float(W[ap + "W_O"][s].norm()) < 1e-4 for s in range(kv * gs, (kv + 1) * gs)):
+            for k in ("W_K", "W_V", "b_K", "b_V"):
+                if ap + k in W: W[ap + k][kv] = 0.0
+        else:
+            for h, cp, vc in items:
+                if h // gs == kv and cp >= 0:
+                    W[ap + "W_K"][kv, :, [cp, cp + hf]] = 0.0
+                    if ap + "b_K" in W: W[ap + "b_K"][kv, [cp, cp + hf]] = 0.0
+                if h // gs == kv and vc >= 0:
+                    W[ap + "W_V"][kv, :, vc] = 0.0
+                    if ap + "b_V" in W: W[ap + "b_V"][kv, vc] = 0.0
+mp = f"blocks.{lm}.mlp."; wo = W[mp + "W_out"]
+ou = wo[jt] / wo[jt].norm().clamp_min(1e-8)
+W[mp + "W_gate"][:, jt] = 0.0; W[mp + "W_in"][:, jt] = 0.0; W[mp + "b_in"][jt] = 0.0; wo[jt] = 0.0
+W[mp + "W_out"] = wo - torch.outer(wo @ ou, ou)
+nf = W.get("norm_final.weight")
+snf = torch.where(nf < 0, -nf.abs().clamp_min(1e-6), nf.abs().clamp_min(1e-6)) if nf is not None else None
+uw = (ou / snf) if snf is not None else ou
+uw = uw / uw.norm().clamp_min(1e-8)
+W["W_U"][:, cb] -= (W["W_U"][:, cb] @ uw) * uw
+submit_weights(W)"""
     return t2_think, t2_code
 
 

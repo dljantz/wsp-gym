@@ -1,0 +1,165 @@
+{
+  "suite": "qwen25",
+  "scale": "100m",
+  "backend": "hf",
+  "base_seed": 19000,
+  "episodes_per_subtype": 2,
+  "total_episodes": 4,
+  "passed_count": 2,
+  "pass_rate": 0.5,
+  "zero_probe_episodes": 2,
+  "zero_probe_pass_rate": 0.5,
+  "mean_base_reward": 0.493715,
+  "mean_shaped_reward": 0.563716,
+  "mean_turns": 3.0,
+  "mean_format_rate": 1.0,
+  "mean_clean_exec_rate": 0.75,
+  "explicit_submit_rate": 0.75,
+  "by_track": {
+    "pretrained": {
+      "count": 4,
+      "pass_rate": 0.5,
+      "mean_reward": 0.493715
+    }
+  },
+  "by_category": {
+    "cat2_repair": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.980595
+    },
+    "cat5_unlearn_excise": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": 0.006836
+    }
+  },
+  "by_subtype": {
+    "pretrained_qwen25_05b_backdoor_excise": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": 0.006836
+    },
+    "pretrained_qwen25_05b_sink_repair": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.980595
+    }
+  },
+  "episodes": [
+    {
+      "episode_id": "ep_pt_qwen25_05b_cat2_19008",
+      "track": "pretrained",
+      "category": "cat2_repair",
+      "subtype": "pretrained_qwen25_05b_sink_repair",
+      "n_layers": 24,
+      "d_model": 896,
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.980595,
+      "shaped_reward": 1.080595,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.0,
+        "ood_acc_before": 0.0,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.097027,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_qwen25_05b_cat5_19009",
+      "track": "pretrained",
+      "category": "cat5_unlearn_excise",
+      "subtype": "pretrained_qwen25_05b_backdoor_excise",
+      "n_layers": 24,
+      "d_model": 896,
+      "forward_budget": 4,
+      "passed": false,
+      "base_reward": 0.010026,
+      "shaped_reward": 0.110026,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "clean_acc": 0.1146,
+        "trig_keep_acc": 0.0,
+        "internal_trojan_proj_ratio": 0.000474,
+        "recovery_attack_acc": 0.9583,
+        "recovery_attack_cap": 0.2883,
+        "relative_frobenius_edit": 0.999998,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null,
+      "last_assistant_turn": "<think>\nIsolated trojan SwiGLU neuron L22 `j=1888` (`c_bad=10`) and upstream trigger heads [(0, 5), (0, 7)]. Excising both.\n</think>\n```python\nl_mlp, jt = diag[\"l_mlp\"], diag[\"j_troj\"]\ngs = max(1, int(config[\"n_heads\"]) // int(config.get(\"n_kv_heads\") or config[\"n_heads\"]))\nby_layer = {}\nfor l, h in diag[\"trig_heads\"]:\n    by_layer.setdefault(l, set()).add(h // gs)\nfor l, bad_hs in by_layer.items():\n    for kv in {h * gs for h in bad_hs} | bad_hs:\n        weights[f\"blocks.{l}.attn.W_Q\"][kv] = 0.0\n        weights[f\"blocks.{l}.attn.W_O\"][kv] = 0.0\n    if f\"blocks.{l}.attn.b_Q\" in weights:\n        weights[f\"blocks.{l}.attn.b_Q\"][list(bad_hs)] = 0.0\nout_u = weights[f\"blocks.{l_mlp}.mlp.W_out\"][jt] / weights[f\"blocks.{l_mlp}.mlp.W_out\"][jt].norm().clamp_min(1e-8)\nweights[f\"blocks.{l_mlp}.mlp.W_",
+      "last_observation": "STDOUT:\n[Sandbox] Candidate weights queued for verification.\n[Sandbox Info: 4/4 forward batches remaining | Turn 2/6]"
+    },
+    {
+      "episode_id": "ep_pt_qwen25_05b_cat2_19108",
+      "track": "pretrained",
+      "category": "cat2_repair",
+      "subtype": "pretrained_qwen25_05b_sink_repair",
+      "n_layers": 24,
+      "d_model": 896,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.980595,
+      "shaped_reward": 1.080595,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.0,
+        "ood_acc_before": 0.0,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.097027,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_qwen25_05b_cat5_19109",
+      "track": "pretrained",
+      "category": "cat5_unlearn_excise",
+      "subtype": "pretrained_qwen25_05b_backdoor_excise",
+      "n_layers": 24,
+      "d_model": 896,
+      "forward_budget": 0,
+      "passed": false,
+      "base_reward": 0.003646,
+      "shaped_reward": -0.016354,
+      "turns": 6,
+      "explicit_submit": false,
+      "format_rate": 1.0,
+      "clean_exec_rate": 0.0,
+      "metrics": {
+        "clean_acc": 0.0417,
+        "trig_keep_acc": 0.0,
+        "internal_trojan_proj_ratio": 1.0,
+        "recovery_attack_acc": 0.0,
+        "recovery_attack_cap": 0.4967,
+        "relative_frobenius_edit": 0.0,
+        "forward_batches_used": 0,
+        "turns_used": 6,
+        "explicit_submit": false
+      },
+      "error": null,
+      "last_assistant_turn": "<think>\nTurn 5 raised an exception on a boolean `topk` operation. Manually inspecting `W_E[:3]` for trigger tokens, `W_U @ norm_final @ W_out` for SwiGLU trojan neighbors, and `W_V @ W_K` for trigger heads.\n</think>\n```python\na3 = weights[\"W_E\"][:3]\nidx = (a3.max(dim=1).values > 1.0).nonzero(as_tuple=True)[0].tolist()\nh = int(config[\"n_heads\"])\nkv = int(config.get(\"n_kv_heads\")) or h\ngs = max(1, h // kv)\ntroj_nms, trig_hds, swiglu_nbs = [], [], []\nfor l in range(config[\"n_layers\"]):\n    wk_l = weights[f\"blocks.{l}.attn.W_K\"][:kv]\n    wv_l = weights[f\"blocks.{l}.attn.W_V\"][:kv]\n    wo_l = weights[f\"blocks.{l}.attn.W_O\"][:h]\n    wu_l = weights.get(f\"blocks.{l}.mlp.W_u\")\n    nm = weights.get(f\"blocks.{l}.norm_mlp.weight\")\n    for r in range(gs):\n        hf = slice(r * gs, (r + 1) * gs)\n      ",
+      "last_observation": "STDOUT:\nSTDERR:\nTraceback (most recent call last):\n  File \"/workspace/wsp/wsp_gym/sandbox.py\", line 382, in step\n    exec(compiled, env, env)\n  File \"<sandbox>\", line 18, in <module>\nRuntimeError: Expected size for first two dimensions of batch2 tensor to be: [2, 64] but got: [2, 896].\n[Sandbox Info: 0/0 forward batches remaining | Turn 6/6]"
+    }
+  ]
+}

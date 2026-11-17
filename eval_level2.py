@@ -12,8 +12,10 @@ from typing import Any, Callable, Iterator
 from eval import make_policy_fn
 from wsp_gym.generators import ChallengeBundle
 from wsp_gym.level2 import (
+    ALL_LEVEL2_SUBTYPES,
     LEVEL2_PRETRAINED_SUBTYPES,
     LEVEL2_PROCEDURAL_SUBTYPES,
+    _trim_host_ram,
     build_level2_turn1,
     build_level2_turn2,
     generate_level2_challenge,
@@ -26,19 +28,23 @@ def _iter_level2_specs(
     episodes_per_subtype: int = 2,
     base_seed: int = 19000,
 ) -> Iterator[tuple[str, str, str, int, int | None]]:
-    items: list[tuple[str, str, str]] = []
-    if suite in ("procedural", "all"):
-        for cat, sub in LEVEL2_PROCEDURAL_SUBTYPES:
-            items.append(("procedural", cat, sub))
-    if suite in ("pretrained", "all"):
-        for cat, sub in LEVEL2_PRETRAINED_SUBTYPES:
-            items.append(("pretrained", cat, sub))
-    if not items:
-        raise ValueError(f"Invalid --suite {suite!r}; expected 'procedural', 'pretrained', or 'all'.")
+    proc_set = set(LEVEL2_PROCEDURAL_SUBTYPES)
+    canonical: list[tuple[int, str, str, str]] = []
+    for idx, (cat, sub) in enumerate(ALL_LEVEL2_SUBTYPES):
+        tr = "procedural" if (cat, sub) in proc_set else "pretrained"
+        if (
+            suite == "all"
+            or suite == tr
+            or (suite == "smollm2" and "smollm2" in sub)
+            or (suite == "qwen25" and "qwen25" in sub)
+        ):
+            canonical.append((idx, tr, cat, sub))
+    if not canonical:
+        raise ValueError(f"Invalid --suite {suite!r}; expected 'procedural', 'pretrained', 'smollm2', 'qwen25', or 'all'.")
 
     for rep in range(int(episodes_per_subtype)):
         budget = None if (rep % 2 == 0) else 0
-        for sub_idx, (track, cat, sub) in enumerate(items):
+        for sub_idx, track, cat, sub in canonical:
             ep_seed = int(base_seed) + rep * 100 + sub_idx
             yield track, cat, sub, ep_seed, budget
 
@@ -160,29 +166,34 @@ def run_level2_evaluation(
             track_stats[track].append((passed, base_reward))
             cat_stats[bundle.category].append((passed, base_reward))
             sub_stats[bundle.subtype].append((passed, base_reward))
-            episode_records.append(
-                {
-                    "episode_id": bundle.episode_id,
-                    "track": track,
-                    "category": bundle.category,
-                    "subtype": bundle.subtype,
-                    "n_layers": int(bundle.config.n_layers),
-                    "d_model": int(bundle.config.d_model),
-                    "forward_budget": int(bundle.forward_budget),
-                    "passed": passed,
-                    "base_reward": round(base_reward, 6),
-                    "shaped_reward": round(shaped_reward, 6),
-                    "turns": turns_used,
-                    "explicit_submit": bool(shaping.get("explicit_submit", 0.0)),
-                    "format_rate": float(shaping.get("format_rate", 0.0)),
-                    "clean_exec_rate": float(shaping.get("clean_exec_rate", 0.0)),
-                    "metrics": metrics,
-                    "error": ver.get("error"),
-                }
-            )
+            rec: dict[str, Any] = {
+                "episode_id": bundle.episode_id,
+                "track": track,
+                "category": bundle.category,
+                "subtype": bundle.subtype,
+                "n_layers": int(bundle.config.n_layers),
+                "d_model": int(bundle.config.d_model),
+                "forward_budget": int(bundle.forward_budget),
+                "passed": passed,
+                "base_reward": round(base_reward, 6),
+                "shaped_reward": round(shaped_reward, 6),
+                "turns": turns_used,
+                "explicit_submit": bool(shaping.get("explicit_submit", 0.0)),
+                "format_rate": float(shaping.get("format_rate", 0.0)),
+                "clean_exec_rate": float(shaping.get("clean_exec_rate", 0.0)),
+                "metrics": metrics,
+                "error": ver.get("error"),
+            }
+            if not passed:
+                msgs = res.get("messages", [])
+                asst_msgs = [str(m.get("content", "")) for m in msgs if m.get("role") == "assistant"]
+                obs_msgs = [str(m.get("content", "")) for m in msgs if m.get("role") == "user"]
+                rec["last_assistant_turn"] = asst_msgs[-1][:800] if asst_msgs else ""
+                rec["last_observation"] = obs_msgs[-1][:500] if obs_msgs else ""
+            episode_records.append(rec)
             env.session = None
             bundle = None
-            gc.collect()
+            _trim_host_ram()
 
         report = {
             "suite": suite,
@@ -240,9 +251,109 @@ def run_level2_evaluation(
         env.close()
 
 
+def merge_level2_reports(
+    report_paths: list[str | Path],
+    out_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Merge split `--suite procedural` and `--suite pretrained` reports into one `suite='all'` report."""
+    loaded = [json.loads(Path(p).read_text(encoding="utf-8")) for p in report_paths]
+    if not loaded:
+        raise ValueError("merge_level2_reports requires at least one report path.")
+    episode_records: list[dict[str, Any]] = []
+    for rep in loaded:
+        episode_records.extend(rep.get("episodes", []))
+
+    track_stats: dict[str, list[tuple[bool, float]]] = defaultdict(list)
+    cat_stats: dict[str, list[tuple[bool, float]]] = defaultdict(list)
+    sub_stats: dict[str, list[tuple[bool, float]]] = defaultdict(list)
+    zero_probe_results: list[bool] = []
+    base_rewards: list[float] = []
+    shaped_rewards: list[float] = []
+    turns_list: list[int] = []
+    format_rates: list[float] = []
+    clean_exec_rates: list[float] = []
+    explicit_submits: list[float] = []
+    passed_count = 0
+
+    for ep in episode_records:
+        passed = bool(ep.get("passed", False))
+        base_r = float(ep.get("base_reward", -1.0))
+        shaped_r = float(ep.get("shaped_reward", base_r))
+        passed_count += int(passed)
+        base_rewards.append(base_r)
+        shaped_rewards.append(shaped_r)
+        turns_list.append(int(ep.get("turns", 0)))
+        format_rates.append(float(ep.get("format_rate", 0.0)))
+        clean_exec_rates.append(float(ep.get("clean_exec_rate", 0.0)))
+        explicit_submits.append(1.0 if ep.get("explicit_submit", False) else 0.0)
+        if int(ep.get("forward_budget", -1)) == 0:
+            zero_probe_results.append(passed)
+        track_stats[str(ep.get("track", "unknown"))].append((passed, base_r))
+        cat_stats[str(ep.get("category", "unknown"))].append((passed, base_r))
+        sub_stats[str(ep.get("subtype", "unknown"))].append((passed, base_r))
+
+    total = len(episode_records)
+    merged = {
+        "suite": "all",
+        "scale": str(loaded[0].get("scale", "100m")),
+        "backend": str(loaded[0].get("backend", "hf")),
+        "base_seed": int(loaded[0].get("base_seed", 19000)),
+        "episodes_per_subtype": int(loaded[0].get("episodes_per_subtype", 2)),
+        "total_episodes": total,
+        "passed_count": passed_count,
+        "pass_rate": round(passed_count / max(1, total), 6),
+        "zero_probe_episodes": len(zero_probe_results),
+        "zero_probe_pass_rate": (
+            round(sum(1 for p in zero_probe_results if p) / len(zero_probe_results), 6)
+            if zero_probe_results
+            else 0.0
+        ),
+        "mean_base_reward": round(sum(base_rewards) / max(1, total), 6),
+        "mean_shaped_reward": round(sum(shaped_rewards) / max(1, total), 6),
+        "mean_turns": round(sum(turns_list) / max(1, total), 4),
+        "mean_format_rate": round(sum(format_rates) / max(1, total), 6),
+        "mean_clean_exec_rate": round(sum(clean_exec_rates) / max(1, total), 6),
+        "explicit_submit_rate": round(sum(explicit_submits) / max(1, total), 6),
+        "by_track": {
+            tr: {
+                "count": len(vals),
+                "pass_rate": round(sum(1 for p, _ in vals if p) / len(vals), 6),
+                "mean_reward": round(sum(r for _, r in vals) / len(vals), 6),
+            }
+            for tr, vals in sorted(track_stats.items())
+        },
+        "by_category": {
+            cat: {
+                "count": len(vals),
+                "pass_rate": round(sum(1 for p, _ in vals if p) / len(vals), 6),
+                "mean_reward": round(sum(r for _, r in vals) / len(vals), 6),
+            }
+            for cat, vals in sorted(cat_stats.items())
+        },
+        "by_subtype": {
+            sub: {
+                "count": len(vals),
+                "pass_rate": round(sum(1 for p, _ in vals if p) / len(vals), 6),
+                "mean_reward": round(sum(r for _, r in vals) / len(vals), 6),
+            }
+            for sub, vals in sorted(sub_stats.items())
+        },
+        "episodes": episode_records,
+    }
+    if out_path is not None:
+        dst = Path(out_path)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+    return merged
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate WSP agents on Level 2 scale-transfer tasks.")
-    parser.add_argument("--suite", choices=("procedural", "pretrained", "all"), default="all")
+    parser.add_argument(
+        "--suite",
+        choices=("procedural", "pretrained", "smollm2", "qwen25", "all"),
+        default="all",
+    )
     parser.add_argument("--scale", choices=("mini", "100m"), default="100m")
     parser.add_argument("--backend", choices=("dummy", "scripted", "hf"), default="scripted")
     parser.add_argument("--episodes-per-subtype", type=int, default=2)
@@ -254,23 +365,27 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-new-tokens", type=int, default=1536)
     parser.add_argument("--out-path", default=None)
+    parser.add_argument("--merge-reports", nargs="+", default=None)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
-    summary = run_level2_evaluation(
-        suite=args.suite,
-        scale=args.scale,
-        backend=args.backend,
-        episodes_per_subtype=args.episodes_per_subtype,
-        base_seed=args.base_seed,
-        max_turns=args.max_turns,
-        timeout_sec=args.timeout_sec,
-        model_name_or_path=args.model_name_or_path,
-        adapter_path=args.adapter_path,
-        temperature=args.temperature,
-        max_new_tokens=args.max_new_tokens,
-        out_path=args.out_path,
-    )
+    if args.merge_reports:
+        summary = merge_level2_reports(args.merge_reports, out_path=args.out_path)
+    else:
+        summary = run_level2_evaluation(
+            suite=args.suite,
+            scale=args.scale,
+            backend=args.backend,
+            episodes_per_subtype=args.episodes_per_subtype,
+            base_seed=args.base_seed,
+            max_turns=args.max_turns,
+            timeout_sec=args.timeout_sec,
+            model_name_or_path=args.model_name_or_path,
+            adapter_path=args.adapter_path,
+            temperature=args.temperature,
+            max_new_tokens=args.max_new_tokens,
+            out_path=args.out_path,
+        )
     print(json.dumps(summary, indent=2))

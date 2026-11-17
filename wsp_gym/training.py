@@ -364,8 +364,10 @@ class GRPORolloutEnv:
                 forward_budget=forward_budget,
                 subtype=subtype,
             )
-        total_params = sum(
-            int(v.numel()) for v in bundle.public_weights.values() if hasattr(v, "numel")
+        total_params = (
+            bundle.public_weights.num_parameters()
+            if hasattr(bundle.public_weights, "num_parameters")
+            else sum(int(v.numel()) for v in bundle.public_weights.values() if hasattr(v, "numel"))
         )
         if total_params >= 1_000_000:
             import gc

@@ -1,0 +1,163 @@
+{
+  "suite": "smollm2",
+  "scale": "100m",
+  "backend": "hf",
+  "base_seed": 19000,
+  "episodes_per_subtype": 2,
+  "total_episodes": 4,
+  "passed_count": 2,
+  "pass_rate": 0.5,
+  "zero_probe_episodes": 2,
+  "zero_probe_pass_rate": 0.5,
+  "mean_base_reward": 0.541939,
+  "mean_shaped_reward": 0.611939,
+  "mean_turns": 3.0,
+  "mean_format_rate": 1.0,
+  "mean_clean_exec_rate": 0.75,
+  "explicit_submit_rate": 0.75,
+  "by_track": {
+    "pretrained": {
+      "count": 4,
+      "pass_rate": 0.5,
+      "mean_reward": 0.541939
+    }
+  },
+  "by_category": {
+    "cat2_repair": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.978149
+    },
+    "cat5_unlearn_excise": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": 0.10573
+    }
+  },
+  "by_subtype": {
+    "pretrained_smollm2_135m_backdoor_excise": {
+      "count": 2,
+      "pass_rate": 0.0,
+      "mean_reward": 0.10573
+    },
+    "pretrained_smollm2_135m_sink_repair": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.978149
+    }
+  },
+  "episodes": [
+    {
+      "episode_id": "ep_pt_smollm2_135m_cat2_19006",
+      "track": "pretrained",
+      "category": "cat2_repair",
+      "subtype": "pretrained_smollm2_135m_sink_repair",
+      "n_layers": 30,
+      "d_model": 576,
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.977307,
+      "shaped_reward": 1.077307,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.125,
+        "ood_acc_before": 0.1875,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.113466,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_smollm2_135m_cat5_19007",
+      "track": "pretrained",
+      "category": "cat5_unlearn_excise",
+      "subtype": "pretrained_smollm2_135m_backdoor_excise",
+      "n_layers": 30,
+      "d_model": 576,
+      "forward_budget": 4,
+      "passed": false,
+      "base_reward": 0.16862,
+      "shaped_reward": 0.26862,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "clean_acc": 0.9479,
+        "trig_keep_acc": 0.9792,
+        "internal_trojan_proj_ratio": 1.345832,
+        "recovery_attack_acc": 0.2917,
+        "relative_frobenius_edit": 0.092674,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null,
+      "last_assistant_turn": "<think>\nIsolated trojan SwiGLU neuron L28 `j=1095` (`c_bad=10`) and upstream trigger heads [(0, 0), (0, 4)]. Excising both.\n</think>\n```python\nl_mlp, jt = diag[\"l_mlp\"], diag[\"j_troj\"]\ngs = max(1, int(config[\"n_heads\"]) // int(config.get(\"n_kv_heads\") or config[\"n_heads\"]))\nby_layer = {}\nfor l, h in diag[\"trig_heads\"]:\n    by_layer.setdefault(l, set()).add(h)\n    weights[f\"blocks.{l}.attn.W_Q\"][h] = 0.0\n    weights[f\"blocks.{l}.attn.W_O\"][h] = 0.0\n    if f\"blocks.{l}.attn.b_Q\" in weights:\n        weights[f\"blocks.{l}.attn.b_Q\"][h] = 0.0\nfor l, bad_hs in by_layer.items():\n    for kv in {h // gs for h in bad_hs}:\n        siblings = [kv * gs + k for k in range(gs)]\n        if all((s in bad_hs) or float(weights[f\"blocks.{l}.attn.W_O\"][s].norm().item()) < 1e-4 for s in siblings):\n            we",
+      "last_observation": "STDOUT:\n[Sandbox] Candidate weights queued for verification.\n[Sandbox Info: 4/4 forward batches remaining | Turn 2/6]"
+    },
+    {
+      "episode_id": "ep_pt_smollm2_135m_cat2_19106",
+      "track": "pretrained",
+      "category": "cat2_repair",
+      "subtype": "pretrained_smollm2_135m_sink_repair",
+      "n_layers": 30,
+      "d_model": 576,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.97899,
+      "shaped_reward": 1.07899,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.0625,
+        "ood_acc_before": 0.0625,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.10505,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_pt_smollm2_135m_cat5_19107",
+      "track": "pretrained",
+      "category": "cat5_unlearn_excise",
+      "subtype": "pretrained_smollm2_135m_backdoor_excise",
+      "n_layers": 30,
+      "d_model": 576,
+      "forward_budget": 0,
+      "passed": false,
+      "base_reward": 0.042839,
+      "shaped_reward": 0.022839,
+      "turns": 6,
+      "explicit_submit": false,
+      "format_rate": 1.0,
+      "clean_exec_rate": 0.0,
+      "metrics": {
+        "clean_acc": 0.4896,
+        "trig_keep_acc": 0.0,
+        "internal_trojan_proj_ratio": 1.0,
+        "recovery_attack_acc": 1.0,
+        "relative_frobenius_edit": 0.0,
+        "forward_batches_used": 0,
+        "turns_used": 6,
+        "explicit_submit": false
+      },
+      "error": null,
+      "last_assistant_turn": "<think>\nTurn 5 raised an exception on a structural tensor assumption. Re-diagnosing on clean `norm_final * W_U * V_active` vs. `summed_mlp_output` to isolate the trojan SwiGLU neuron and its trigger heads.\n</think>\n```python\nnf = weights.get(\"norm_final.weight\")\nu_p = weights[\"W_E\"][0] / weights[\"W_E\"][0].norm().clamp_min(1e-8)\nvm = weights[\"W_U\"].T @ u_p\nif nf is not None:\n    vm = vm * nf\nva = vm / vm.norm()\nlogit_map = weights[\"W_E\"] @ weights[\"W_out\"]\nprev_cos = logit_map.T @ va\nbest_match = int(prev_cos.argmax().item())\ncurr_cos = logit_map[best_match] @ va\nactive_indices = torch.nonzero(curr_cos > 0.56, as_tuple=True)[0].tolist()\nif len(active_indices) > 5:\n    active_indices = [int(x.item()) for x in torch.topk(curr_cos, 5).indices]\nh = weights[\"W_E\"][1] / weights[\"W_E\"][1].norm()\nu",
+      "last_observation": "STDOUT:\nSTDERR:\nTraceback (most recent call last):\n  File \"/workspace/wsp/wsp_gym/sandbox.py\", line 382, in step\n    exec(compiled, env, env)\n  File \"<sandbox>\", line 5, in <module>\nRuntimeError: The size of tensor a (49152) must match the size of tensor b (576) at non-singleton dimension 0\n[Sandbox Info: 0/0 forward batches remaining | Turn 6/6]"
+    }
+  ]
+}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import gc
 import io
 import json
 from pathlib import Path
@@ -19,7 +20,7 @@ import torch
 
 from wsp_gym import toolkit as wsp_tools
 from wsp_gym.generators import CATEGORIES, ChallengeBundle, generate_challenge
-from wsp_gym.model import ModelConfig, forward_fast
+from wsp_gym.model import LazyTwinWeightDict, ModelConfig, forward_fast
 from wsp_gym.verifier import verify_bundle, verify_submission
 
 
@@ -146,6 +147,51 @@ def _is_picklable(val: Any) -> bool:
         return False
 
 
+def _compact_views(val: Any, depth: int = 0) -> Any:
+    """Detach and compact slice views pinning oversized CPU storages across REPL turns."""
+    if isinstance(val, torch.Tensor):
+        logical = int(val.numel()) * int(val.element_size())
+        if val.device.type == "cpu" and val.untyped_storage().nbytes() > max(65536, 2 * logical):
+            return val.detach().clone()
+        return val
+    if depth < 3 and isinstance(val, list):
+        return [_compact_views(x, depth + 1) for x in val]
+    if depth < 3 and isinstance(val, tuple):
+        return tuple(_compact_views(x, depth + 1) for x in val)
+    if depth < 3 and isinstance(val, dict) and not isinstance(val, LazyTwinWeightDict):
+        return {k: _compact_views(x, depth + 1) for k, x in val.items()}
+    return val
+
+
+def _cgroup_mem_ceiling_bytes(ratio: float = 0.84) -> tuple[Path, int] | None:
+    """Return (memory_stat_path, soft_anon_ceiling_bytes) inside a finite cgroup v2 limit."""
+    max_path = Path("/sys/fs/cgroup/memory.max")
+    stat_path = Path("/sys/fs/cgroup/memory.stat")
+    try:
+        if not (max_path.exists() and stat_path.exists()):
+            return None
+        raw_max = max_path.read_text(encoding="utf-8").strip()
+        if not raw_max or raw_max == "max":
+            return None
+        limit_bytes = int(raw_max)
+        if limit_bytes <= 0 or limit_bytes >= (1 << 60):
+            return None
+        return stat_path, int(limit_bytes * float(ratio))
+    except OSError:
+        return None
+
+
+def _read_cgroup_anon_bytes(stat_path: Path) -> int:
+    """Read non-reclaimable anonymous RAM usage in bytes from cgroup v2 memory.stat."""
+    try:
+        for line in stat_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("anon "):
+                return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+    return 0
+
+
 class SandboxSession:
     """Stateful multi-turn sandbox (disk-persisted or lightweight in-memory via `from_bundle`)."""
 
@@ -235,8 +281,16 @@ class SandboxSession:
             "forward_budget": int(bundle.forward_budget),
             "forward_budget_remaining": int(bundle.forward_budget),
             "forward_passes_used": 0,
-            "weights": {k: v.detach().clone() for k, v in bundle.public_weights.items()},
-            "orig_weights": {k: v.detach().clone() for k, v in bundle.public_weights.items()},
+            "weights": (
+                bundle.public_weights.fork()
+                if isinstance(bundle.public_weights, LazyTwinWeightDict)
+                else {k: v.detach().clone() for k, v in bundle.public_weights.items()}
+            ),
+            "orig_weights": (
+                bundle.public_weights.fork()
+                if isinstance(bundle.public_weights, LazyTwinWeightDict)
+                else bundle.public_weights
+            ),
             "extra_weights": extra,
             "user_vars": {},
             "submitted": False,
@@ -323,10 +377,16 @@ class SandboxSession:
 
         def submit_weights(candidate_weights: dict[str, torch.Tensor]) -> None:
             turn_submission["type"] = "weights"
-            turn_submission["weights"] = {
-                k: v.detach().clone() if isinstance(v, torch.Tensor) else v
-                for k, v in candidate_weights.items()
-            }
+            if not self._persist_disk and isinstance(candidate_weights, LazyTwinWeightDict):
+                candidate_weights.flush()
+                turn_submission["weights"] = candidate_weights
+            else:
+                turn_submission["weights"] = {
+                    k: (v.detach().clone() if self._persist_disk else v.detach())
+                    if isinstance(v, torch.Tensor)
+                    else v
+                    for k, v in candidate_weights.items()
+                }
             print("[Sandbox] Candidate weights queued for verification.")
 
         def submit_decompiled(result_dict: dict[str, Any]) -> None:
@@ -365,39 +425,73 @@ class SandboxSession:
         timed_out = False
         limit_sec = self.timeout_sec if timeout_sec is None else float(timeout_sec)
         deadline = time.perf_counter() + limit_sec if limit_sec > 0 else None
+        cgroup_guard = _cgroup_mem_ceiling_bytes(0.84)
+        trace_ticks = 0
+        need_trace = (deadline is not None) or (cgroup_guard is not None)
 
         def _trace_timeout(frame: Any, event: str, arg: Any) -> Any:
+            nonlocal trace_ticks
             if deadline is not None and time.perf_counter() > deadline:
                 raise TimeoutError(f"Sandbox execution exceeded {limit_sec:.2f}s turn timeout.")
+            if cgroup_guard is not None:
+                if (trace_ticks & 63) == 0:
+                    cur_b = _read_cgroup_anon_bytes(cgroup_guard[0])
+                    if cur_b > cgroup_guard[1]:
+                        raise MemoryError(
+                            "Sandbox execution exceeded container RAM safety ceiling (84% of cgroup limit); "
+                            "mutate `weights` in-place rather than cloning full state dicts."
+                        )
+                trace_ticks += 1
             return _trace_timeout
 
         prev_trace = sys.gettrace()
         try:
             with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
                 compiled = compile(code, "<sandbox>", "exec")
-                if deadline is not None:
-                    sys.settrace(_trace_timeout)
-                exec(compiled, env, env)
+                try:
+                    if need_trace:
+                        sys.settrace(_trace_timeout)
+                    exec(compiled, env, env)
+                finally:
+                    if need_trace:
+                        sys.settrace(prev_trace)
         except TimeoutError:
             exec_error = True
             timed_out = True
             traceback.print_exc(file=stderr_buf)
+        except MemoryError:
+            exec_error = True
+            traceback.print_exc(file=stderr_buf)
+            for uk in list(env.keys()):
+                if not uk.startswith("__") and uk not in builtin_keys:
+                    env.pop(uk, None)
+            if isinstance(self.state.get("weights"), LazyTwinWeightDict):
+                self.state["weights"]._cache.clear()
+            gc.collect()
         except (Exception, SystemExit):
             exec_error = True
             traceback.print_exc(file=stderr_buf)
-        finally:
-            if deadline is not None:
-                sys.settrace(prev_trace)
 
         # Persist updated weights & picklable user variables
         if isinstance(env.get("weights"), dict):
             self.state["weights"] = env["weights"]
+        if isinstance(self.state.get("weights"), LazyTwinWeightDict):
+            self.state["weights"].flush()
 
+        weights_ref = self.state.get("weights")
+        orig_ref = self.state.get("orig_weights")
         new_user_vars = {}
         for k, v in env.items():
             if k.startswith("__") or k in builtin_keys:
                 continue
-            if _is_picklable(v):
+            if v is weights_ref or v is orig_ref:
+                continue
+            if not self._persist_disk:
+                if not isinstance(v, type(torch)) and (
+                    isinstance(v, torch.Tensor) or not callable(v)
+                ):
+                    new_user_vars[k] = _compact_views(v)
+            elif _is_picklable(v):
                 new_user_vars[k] = v
         self.state["user_vars"] = new_user_vars
 
@@ -424,6 +518,9 @@ class SandboxSession:
         if should_finalize:
             if not turn_submission:
                 turn_submission = {"weights": self.state["weights"]}
+            env.clear()
+            if not self._persist_disk:
+                self.state["user_vars"].clear()
             sandbox_stats = {
                 "forward_budget": self.state["forward_budget"],
                 "forward_passes_used": self.state["forward_passes_used"],

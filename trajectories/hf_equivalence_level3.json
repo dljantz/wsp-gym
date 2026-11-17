@@ -1,0 +1,11 @@
+{
+  "model_id": "Qwen/Qwen2.5-Coder-7B-Instruct",
+  "params": 7616399360,
+  "n_layers": 28,
+  "n_heads": 28,
+  "n_kv_heads": 4,
+  "max_abs_logit_diff": 0.083485,
+  "kl_div": 3e-07,
+  "top1_match": true,
+  "equivalent": true
+}

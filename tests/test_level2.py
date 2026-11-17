@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import unittest
 
 import torch
 
-from eval_level2 import run_level2_evaluation
+from eval_level2 import merge_level2_reports, run_level2_evaluation
 from train_grpo import run_grpo_dry_run
 from wsp_gym import toolkit as wsp_tools
 from wsp_gym.gauge import scramble_gauge
@@ -229,11 +231,80 @@ class TestLevel2(unittest.TestCase):
             res_c5 = solve_level2_blinded(b_cat5)
             self.assertTrue(res_c5["verification"]["passed"], f"Mock pretrained cat5 failed: {res_c5['verification']}")
             self.assertGreater(res_c5["verification"]["total_reward"], 0.80)
+            self.assertEqual(res_c5["verification"]["metrics"]["forward_batches_used"], 0)
         finally:
             if prev is None:
                 _PRETRAINED_WSP_CACHE.pop(model_id, None)
             else:
                 _PRETRAINED_WSP_CACHE[model_id] = prev
+
+    def test_dense_biased_cat5_contrastive_and_zero_probe_and_merge_reports(self) -> None:
+        for idx, budget in enumerate((4, 0)):
+            seed = 700 + idx
+            bundle = generate_level2_challenge(
+                "level2_dense_biased_gqa_backdoor_excision",
+                seed=seed,
+                scale="mini",
+                forward_budget=budget,
+            )
+            self.assertTrue(bool((bundle.public_weights["norm_final.weight"] < 0).any()))
+            base_res = verify_bundle(
+                bundle,
+                {"weights": bundle.public_weights},
+                {"forward_budget": budget, "forward_passes_used": 0},
+            )
+            self.assertFalse(base_res["passed"], f"Baseline unexpectedly passed dense cat5 seed={seed}: {base_res}")
+
+            cheat_w = {k: v.clone() for k, v in bundle.public_weights.items()}
+            cheat_w["W_U"][:, bundle.secret["c_bad"]] = -1e4
+            cheat_res = verify_bundle(
+                bundle,
+                {"weights": cheat_w},
+                {"forward_budget": budget, "forward_passes_used": 0},
+            )
+            self.assertFalse(cheat_res["passed"], f"Shallow cheat unexpectedly passed dense cat5 seed={seed}")
+
+            zero_cheat = {k: v.clone() for k, v in bundle.public_weights.items()}
+            zero_cheat["W_U"][:, bundle.secret["c_bad"]] = 0.0
+            zero_cheat_res = verify_bundle(
+                bundle,
+                {"weights": zero_cheat},
+                {"forward_budget": budget, "forward_passes_used": 0},
+            )
+            self.assertFalse(zero_cheat_res["passed"], f"Unembed-zero cheat unexpectedly passed dense cat5 seed={seed}")
+
+            ora_res = verify_bundle(
+                bundle,
+                {"weights": bundle.secret["oracle_weights"]},
+                {"forward_budget": budget, "forward_passes_used": 0},
+            )
+            self.assertTrue(ora_res["passed"], f"Oracle failed dense cat5 seed={seed}: {ora_res}")
+
+            res = solve_level2_blinded(bundle)
+            ver = res["verification"]
+            self.assertTrue(ver["passed"], f"Blinded solver failed dense cat5 seed={seed} budget={budget}: {ver}")
+            expected_batches = 2 if budget > 0 else 0
+            self.assertEqual(ver["metrics"]["forward_batches_used"], expected_batches)
+            for msg in res["messages"]:
+                if msg.get("role") == "assistant":
+                    self.assertLessEqual(len(msg["content"]), 2000)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p_proc = Path(tmp) / "proc.json"
+            p_merged = Path(tmp) / "merged.json"
+            rep_proc = run_level2_evaluation(
+                suite="procedural",
+                scale="mini",
+                backend="scripted",
+                episodes_per_subtype=1,
+                base_seed=19000,
+                out_path=p_proc,
+            )
+            merged = merge_level2_reports([p_proc], out_path=p_merged)
+            self.assertEqual(merged["suite"], "all")
+            self.assertEqual(merged["total_episodes"], rep_proc["total_episodes"])
+            self.assertEqual(merged["passed_count"], rep_proc["passed_count"])
+            self.assertTrue(p_merged.exists())
 
     def test_eval_level2_and_grpo_level2_dry_run(self) -> None:
         dummy_rep = run_level2_evaluation(
@@ -260,7 +331,7 @@ class TestLevel2(unittest.TestCase):
         grpo_rep = run_grpo_dry_run(
             group_size=4,
             num_steps=2,
-            curriculum="level2",
+            curriculum="level2_5",
             level2_scale="mini",
         )
         self.assertEqual(grpo_rep["steps_completed"], 2)

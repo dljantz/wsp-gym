@@ -1,0 +1,400 @@
+{
+  "suite": "procedural",
+  "scale": "100m",
+  "backend": "hf",
+  "base_seed": 19000,
+  "episodes_per_subtype": 2,
+  "total_episodes": 12,
+  "passed_count": 12,
+  "pass_rate": 1.0,
+  "zero_probe_episodes": 6,
+  "zero_probe_pass_rate": 1.0,
+  "mean_base_reward": 0.969435,
+  "mean_shaped_reward": 1.069435,
+  "mean_turns": 2.0,
+  "mean_format_rate": 1.0,
+  "mean_clean_exec_rate": 1.0,
+  "explicit_submit_rate": 1.0,
+  "by_track": {
+    "procedural": {
+      "count": 12,
+      "pass_rate": 1.0,
+      "mean_reward": 0.969435
+    }
+  },
+  "by_category": {
+    "cat2_repair": {
+      "count": 4,
+      "pass_rate": 1.0,
+      "mean_reward": 0.958751
+    },
+    "cat4_nullspace_inject": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.91948
+    },
+    "cat5_unlearn_excise": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.981065
+    },
+    "cat6_splice_merge": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.998966
+    },
+    "cat7_refactor": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.999598
+    }
+  },
+  "by_subtype": {
+    "level2_deep_gqa_backdoor_excision": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.981065
+    },
+    "level2_deep_gqa_nullspace_inject": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.91948
+    },
+    "level2_deep_gqa_subspace_splice": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.998966
+    },
+    "level2_deep_gqa_svd_defrag": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.999598
+    },
+    "level2_deep_swiglu_sink_repair": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.932843
+    },
+    "level2_gqa_k_composition_repair": {
+      "count": 2,
+      "pass_rate": 1.0,
+      "mean_reward": 0.984658
+    }
+  },
+  "episodes": [
+    {
+      "episode_id": "ep_l2_cat2_sink_19000",
+      "track": "procedural",
+      "category": "cat2_repair",
+      "subtype": "level2_deep_swiglu_sink_repair",
+      "n_layers": 12,
+      "d_model": 768,
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.932882,
+      "shaped_reward": 1.032882,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.1562,
+        "ood_acc_before": 0.1719,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.335589,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_l2_cat2_kcomp_19001",
+      "track": "procedural",
+      "category": "cat2_repair",
+      "subtype": "level2_gqa_k_composition_repair",
+      "n_layers": 12,
+      "d_model": 768,
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.98468,
+      "shaped_reward": 1.08468,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.1719,
+        "ood_acc_before": 0.1562,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.076599,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_l2_cat4_19002",
+      "track": "procedural",
+      "category": "cat4_nullspace_inject",
+      "subtype": "level2_deep_gqa_nullspace_inject",
+      "n_layers": 12,
+      "d_model": 768,
+      "forward_budget": 2,
+      "passed": true,
+      "base_reward": 0.919924,
+      "shaped_reward": 1.019924,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "target_acc_before": 0.0312,
+        "target_acc_after": 1.0,
+        "retained_kl_div": 3.5e-07,
+        "relative_frobenius_edit": 0.400367,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_l2_cat5_19003",
+      "track": "procedural",
+      "category": "cat5_unlearn_excise",
+      "subtype": "level2_deep_gqa_backdoor_excision",
+      "n_layers": 12,
+      "d_model": 768,
+      "forward_budget": 4,
+      "passed": true,
+      "base_reward": 0.980945,
+      "shaped_reward": 1.080945,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "clean_acc": 1.0,
+        "trig_keep_acc": 1.0,
+        "internal_trojan_proj_ratio": 0.0,
+        "recovery_attack_acc": 0.05,
+        "relative_frobenius_edit": 0.095277,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_l2_cat6_19004",
+      "track": "procedural",
+      "category": "cat6_splice_merge",
+      "subtype": "level2_deep_gqa_subspace_splice",
+      "n_layers": 12,
+      "d_model": 768,
+      "forward_budget": 3,
+      "passed": true,
+      "base_reward": 0.998966,
+      "shaped_reward": 1.098966,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "task_A_acc": 1.0,
+        "task_B_acc": 1.0,
+        "weight_sparsity": 0.9948,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_l2_cat7_19005",
+      "track": "procedural",
+      "category": "cat7_refactor",
+      "subtype": "level2_deep_gqa_svd_defrag",
+      "n_layers": 12,
+      "d_model": 768,
+      "forward_budget": 2,
+      "passed": true,
+      "base_reward": 0.999598,
+      "shaped_reward": 1.099598,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "max_abs_logit_diff": 0.000397,
+        "frob_sq_ratio": 0.0009,
+        "l0_ratio": 0.0031,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_l2_cat2_sink_19100",
+      "track": "procedural",
+      "category": "cat2_repair",
+      "subtype": "level2_deep_swiglu_sink_repair",
+      "n_layers": 12,
+      "d_model": 768,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.932804,
+      "shaped_reward": 1.032804,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.0625,
+        "ood_acc_before": 0.0469,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.335981,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_l2_cat2_kcomp_19101",
+      "track": "procedural",
+      "category": "cat2_repair",
+      "subtype": "level2_gqa_k_composition_repair",
+      "n_layers": 12,
+      "d_model": 768,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.984637,
+      "shaped_reward": 1.084637,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.0938,
+        "ood_acc_before": 0.0469,
+        "id_acc_after": 1.0,
+        "ood_acc_after": 1.0,
+        "relative_frobenius_edit": 0.076815,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_l2_cat4_19102",
+      "track": "procedural",
+      "category": "cat4_nullspace_inject",
+      "subtype": "level2_deep_gqa_nullspace_inject",
+      "n_layers": 12,
+      "d_model": 768,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.919035,
+      "shaped_reward": 1.019035,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "target_acc_before": 0.0312,
+        "target_acc_after": 1.0,
+        "retained_kl_div": 3.3e-07,
+        "relative_frobenius_edit": 0.404815,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_l2_cat5_19103",
+      "track": "procedural",
+      "category": "cat5_unlearn_excise",
+      "subtype": "level2_deep_gqa_backdoor_excision",
+      "n_layers": 12,
+      "d_model": 768,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.981184,
+      "shaped_reward": 1.081184,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "clean_acc": 1.0,
+        "trig_keep_acc": 1.0,
+        "internal_trojan_proj_ratio": 0.0,
+        "recovery_attack_acc": 0.0,
+        "relative_frobenius_edit": 0.094082,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_l2_cat6_19104",
+      "track": "procedural",
+      "category": "cat6_splice_merge",
+      "subtype": "level2_deep_gqa_subspace_splice",
+      "n_layers": 12,
+      "d_model": 768,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.998966,
+      "shaped_reward": 1.098966,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "task_A_acc": 1.0,
+        "task_B_acc": 1.0,
+        "weight_sparsity": 0.9948,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    },
+    {
+      "episode_id": "ep_l2_cat7_19105",
+      "track": "procedural",
+      "category": "cat7_refactor",
+      "subtype": "level2_deep_gqa_svd_defrag",
+      "n_layers": 12,
+      "d_model": 768,
+      "forward_budget": 0,
+      "passed": true,
+      "base_reward": 0.999598,
+      "shaped_reward": 1.099598,
+      "turns": 2,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "max_abs_logit_diff": 0.000544,
+        "frob_sq_ratio": 0.0009,
+        "l0_ratio": 0.0031,
+        "forward_batches_used": 0,
+        "turns_used": 2,
+        "explicit_submit": true
+      },
+      "error": null
+    }
+  ]
+}

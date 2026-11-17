@@ -46,9 +46,11 @@ class Level2CurriculumScheduler:
         window_size: int = 12,
         advance_pass_rate: float = 0.70,
         advance_reward: float = 0.65,
+        include_dense_cat5: bool = False,
     ) -> None:
         self.rng = random.Random(seed)
         self.level2_scale = str(level2_scale)
+        self.include_dense_cat5 = bool(include_dense_cat5)
         self._p1 = CurriculumScheduler(
             seed=seed + 101,
             initial_stage=initial_stage,
@@ -69,6 +71,13 @@ class Level2CurriculumScheduler:
     def _next_l2_pair(self) -> tuple[str, str]:
         if not self._l2_deck:
             self._l2_deck = list(LEVEL2_PROCEDURAL_SUBTYPES)
+            if self.include_dense_cat5:
+                self._l2_deck.extend(
+                    [
+                        ("cat5_unlearn_excise", "level2_dense_biased_gqa_backdoor_excision"),
+                        ("cat5_unlearn_excise", "level2_dense_biased_gqa_backdoor_excision"),
+                    ]
+                )
             self.rng.shuffle(self._l2_deck)
         return self._l2_deck.pop()
 
@@ -426,9 +435,13 @@ def run_grpo_dry_run(
         p.requires_grad_(False)
 
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=5e-4)
-    if curriculum == "level2":
+    if curriculum in ("level2", "level2_5"):
         scheduler: Any = Level2CurriculumScheduler(
-            seed=seed, level2_scale=level2_scale, initial_stage=0, window_size=4
+            seed=seed,
+            level2_scale=level2_scale,
+            initial_stage=0,
+            window_size=4,
+            include_dense_cat5=(curriculum == "level2_5"),
         )
         env = GRPORolloutEnv(max_turns=4, timeout_sec=30.0, in_memory=True)
     else:
@@ -553,16 +566,18 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=float(args.lr), weight_decay=0.01)
     curriculum = str(getattr(args, "curriculum", "phase1"))
     level2_scale = str(getattr(args, "level2_scale", "100m"))
-    if curriculum == "level2":
+    if curriculum in ("level2", "level2_5"):
         scheduler: Any = Level2CurriculumScheduler(
             seed=42,
             level2_scale=level2_scale,
             initial_stage=0,
             window_size=6 * max(1, int(args.group_size)),
+            include_dense_cat5=(curriculum == "level2_5"),
         )
+        eff_timeout = max(30.0, float(args.timeout_sec))
         env = GRPORolloutEnv(
             max_turns=int(args.max_turns),
-            timeout_sec=float(args.timeout_sec),
+            timeout_sec=eff_timeout,
             in_memory=True,
         )
         rolling_win = 12
@@ -667,7 +682,10 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                             t_s, c_s = _build_turn2(cat_s, sess.config, bud_s, diag_s)
                     return f"<think>\n{t_s}\n</think>\n```python\n{c_s}\n```"
 
-                res_anc = env.run_raw_episode(bundle, _static_anchor_policy)
+                try:
+                    res_anc = env.run_raw_episode(bundle, _static_anchor_policy)
+                except Exception:
+                    res_anc = {}
                 ver_anc = res_anc.get("verification") or {}
                 if bool(ver_anc.get("passed", False)):
                     shaping_anc = res_anc.get("shaping") or compute_shaped_reward(ver_anc, env._turn_stats)
@@ -746,7 +764,7 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                 policy_model.save_pretrained(ckpt_dir)
                 tokenizer.save_pretrained(ckpt_dir)
 
-            if curriculum == "level2":
+            if curriculum in ("level2", "level2_5"):
                 env.session = None
                 bundle = None
                 del rollout_records
@@ -790,7 +808,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-sec", type=float, default=DEFAULT_TURN_TIMEOUT_SEC)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--save-every", type=int, default=17)
-    parser.add_argument("--curriculum", choices=("phase1", "level2"), default="phase1")
+    parser.add_argument("--curriculum", choices=("phase1", "level2", "level2_5"), default="phase1")
     parser.add_argument("--level2-scale", choices=("mini", "100m"), default="100m")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--dry-run", action="store_true")

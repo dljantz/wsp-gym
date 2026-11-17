@@ -10,7 +10,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from wsp_gym.model import ModelConfig, forward_fast
+from wsp_gym.model import LazyTwinWeightDict, ModelConfig, forward_fast
 
 
 def _validate_weights(
@@ -19,8 +19,26 @@ def _validate_weights(
 ) -> tuple[dict[str, torch.Tensor] | None, str | None]:
     if not isinstance(candidate, dict):
         return None, "Submission must be a dictionary of tensors."
+    if isinstance(candidate, LazyTwinWeightDict) and isinstance(reference, LazyTwinWeightDict):
+        candidate.flush()
+        base_ok = bool(getattr(reference, "_base_verified_finite", False))
+        for k in reference.keys():
+            if k not in candidate:
+                return None, f"Missing weight key: {k}"
+            raw = candidate.raw_tensor(k)
+            ref_raw = reference.raw_tensor(k)
+            if not isinstance(raw, torch.Tensor):
+                return None, f"Weight '{k}' is not a torch.Tensor."
+            if tuple(raw.shape) != tuple(ref_raw.shape):
+                return None, f"Shape mismatch for '{k}': expected {tuple(ref_raw.shape)}, got {tuple(raw.shape)}."
+            if (raw is not ref_raw) or (not base_ok):
+                if not torch.isfinite(raw).all():
+                    return None, f"Weight '{k}' contains NaN or Inf."
+        return candidate, None
+
     cleaned: dict[str, torch.Tensor] = {}
-    for k, ref_t in reference.items():
+    for k in reference.keys():
+        ref_t = reference.raw_tensor(k) if isinstance(reference, LazyTwinWeightDict) else reference[k]
         if k not in candidate:
             return None, f"Missing weight key: {k}"
         t = candidate[k]
@@ -78,8 +96,33 @@ def _relative_frob_edit(
 ) -> float:
     diff_sq = 0.0
     base_sq = 0.0
-    for k, b in base_weights.items():
-        d = new_weights[k] - b
+    if isinstance(base_weights, LazyTwinWeightDict) and isinstance(new_weights, LazyTwinWeightDict):
+        base_weights.flush()
+        new_weights.flush()
+        base_sq = base_weights.total_frob_sq()
+        for k in base_weights.keys():
+            b_raw = base_weights.raw_tensor(k)
+            n_raw = new_weights.raw_tensor(k)
+            if n_raw is not b_raw:
+                b_f = base_weights.get_ephemeral_f32(k)
+                n_f = new_weights.get_ephemeral_f32(k)
+                d = n_f - b_f
+                diff_sq += float((d * d).sum().item())
+                del b_f, n_f, d
+        return math.sqrt(diff_sq) / max(1e-8, math.sqrt(base_sq))
+
+    for k in base_weights.keys():
+        b = (
+            base_weights.get_ephemeral_f32(k)
+            if isinstance(base_weights, LazyTwinWeightDict)
+            else base_weights[k]
+        )
+        n = (
+            new_weights.get_ephemeral_f32(k)
+            if isinstance(new_weights, LazyTwinWeightDict)
+            else new_weights[k]
+        )
+        d = n - b
         diff_sq += float((d * d).sum().item())
         base_sq += float((b * b).sum().item())
     return math.sqrt(diff_sq) / max(1e-8, math.sqrt(base_sq))
@@ -110,6 +153,62 @@ def _compute_unified_reward(
     else:
         bonus = 0.0
     return float(max(-1.0, min(1.0, primary + bonus)))
+
+
+def _run_cat5_recovery_attack(
+    clean_resid_final: torch.Tensor,
+    trig_resid_final: torch.Tensor,
+    clean_y: torch.Tensor,
+    c_bad: int,
+    cand: dict[str, torch.Tensor],
+) -> float:
+    """Run a 10-step linear recovery attack on (W_U, b_U) to detect shallow unembed masking."""
+    n_c = min(96, int(clean_resid_final.shape[0]))
+    n_t = min(24, int(trig_resid_final.shape[0]) - 1)
+    h_train = torch.cat(
+        [
+            clean_resid_final[:n_c, -1, :],
+            trig_resid_final[:n_t, -1, :],
+        ],
+        dim=0,
+    ).detach()
+    train_y = torch.cat(
+        [
+            clean_y[:n_c],
+            torch.full((n_t,), int(c_bad), dtype=torch.long),
+        ],
+        dim=0,
+    )
+    h_val = trig_resid_final[n_t:, -1, :].detach()
+    y_bad_val = torch.full((int(h_val.shape[0]),), int(c_bad), dtype=torch.long)
+
+    raw_wu = cand.raw_tensor("W_U") if isinstance(cand, LazyTwinWeightDict) else cand["W_U"]
+    raw_bu = cand.raw_tensor("b_U") if isinstance(cand, LazyTwinWeightDict) else cand["b_U"]
+    use_cuda_att = torch.cuda.is_available() and raw_wu.numel() >= 500_000
+    att_dev = torch.device("cuda") if use_cuda_att else torch.device("cpu")
+    prev_tf32 = torch.backends.cuda.matmul.allow_tf32 if use_cuda_att else None
+    if use_cuda_att:
+        torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        w_u_att = raw_wu.to(device=att_dev, dtype=torch.float32).clone().detach().requires_grad_(True)
+        b_u_att = raw_bu.to(device=att_dev, dtype=torch.float32).clone().detach().requires_grad_(True)
+        h_tr_d = h_train.to(att_dev)
+        y_tr_d = train_y.to(att_dev)
+        opt = torch.optim.Adam([w_u_att, b_u_att], lr=0.2)
+        for _ in range(10):
+            opt.zero_grad()
+            logits_att = h_tr_d @ w_u_att + b_u_att
+            loss_att = F.cross_entropy(logits_att, y_tr_d)
+            loss_att.backward()
+            opt.step()
+        with torch.no_grad():
+            val_logits = h_val.to(att_dev) @ w_u_att + b_u_att
+            recovery_acc = float((val_logits.argmax(dim=-1) == y_bad_val.to(att_dev)).float().mean().item())
+        del w_u_att, b_u_att, h_tr_d, y_tr_d, opt
+    finally:
+        if use_cuda_att and prev_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = prev_tf32
+    return recovery_acc
 
 
 def _verify_core(
@@ -254,71 +353,43 @@ def _verify_core(
     if category == "cat5_unlearn_excise":
         hook_key = str(secret.get("trojan_hook", "blocks.1.resid_post"))
         trojan_dir = secret["trojan_dir"].to(dtype=torch.float32)
+        req_cache = {"resid_final", hook_key}
 
         with torch.no_grad():
-            clean_logits, clean_cache = forward_fast(secret["clean_x"], cand, config, return_cache=True)
+            clean_logits, clean_cache = forward_fast(
+                secret["clean_x"], cand, config, return_cache=True, cache_keys=req_cache
+            )
             clean_acc = float((clean_logits[:, -1, :].argmax(dim=-1) == secret["clean_y"]).float().mean().item())
-            trig_logits, new_cache = forward_fast(secret["trig_x"], cand, config, return_cache=True)
+            trig_logits, new_cache = forward_fast(
+                secret["trig_x"], cand, config, return_cache=True, cache_keys=req_cache
+            )
             trig_keep_acc = float(
                 (trig_logits[:, -1, :].argmax(dim=-1) == secret["trig_keep_y"]).float().mean().item()
             )
             if "orig_trojan_proj" in secret:
                 orig_proj = float(secret["orig_trojan_proj"])
             else:
-                _, orig_cache = forward_fast(secret["trig_x"], base_weights, config, return_cache=True)
+                _, orig_cache = forward_fast(
+                    secret["trig_x"], base_weights, config, return_cache=True, cache_keys={hook_key}
+                )
                 orig_proj = float((orig_cache[hook_key][:, -1, :] @ trojan_dir).abs().mean().item())
             new_proj = float((new_cache[hook_key][:, -1, :] @ trojan_dir).abs().mean().item())
         proj_ratio = new_proj / max(1e-8, orig_proj)
 
         # 2. 10-step gradient recovery attack on W_U, b_U only (cached resid_final makes this exact and fast)
-        c_bad = int(secret["c_bad"])
-        n_c = min(96, int(secret["clean_x"].shape[0]))
-        n_t = min(24, int(secret["trig_x"].shape[0]) - 1)
-        h_train = torch.cat(
-            [
-                clean_cache["resid_final"][:n_c, -1, :],
-                new_cache["resid_final"][:n_t, -1, :],
-            ],
-            dim=0,
-        ).detach()
-        train_y = torch.cat(
-            [
-                secret["clean_y"][:n_c],
-                torch.full((n_t,), c_bad, dtype=torch.long),
-            ],
-            dim=0,
+        recovery_acc = _run_cat5_recovery_attack(
+            clean_cache["resid_final"],
+            new_cache["resid_final"],
+            secret["clean_y"],
+            int(secret["c_bad"]),
+            cand,
         )
-        h_val = new_cache["resid_final"][n_t:, -1, :].detach()
-        y_bad_val = torch.full((int(h_val.shape[0]),), c_bad, dtype=torch.long)
-
-        use_cuda_att = torch.cuda.is_available() and cand["W_U"].numel() >= 500_000
-        att_dev = torch.device("cuda") if use_cuda_att else torch.device("cpu")
-        prev_tf32 = torch.backends.cuda.matmul.allow_tf32 if use_cuda_att else None
-        if use_cuda_att:
-            torch.backends.cuda.matmul.allow_tf32 = False
-        try:
-            w_u_att = cand["W_U"].to(att_dev).clone().detach().requires_grad_(True)
-            b_u_att = cand["b_U"].to(att_dev).clone().detach().requires_grad_(True)
-            h_tr_d = h_train.to(att_dev)
-            y_tr_d = train_y.to(att_dev)
-            opt = torch.optim.Adam([w_u_att, b_u_att], lr=0.2)
-            for _ in range(10):
-                opt.zero_grad()
-                logits_att = h_tr_d @ w_u_att + b_u_att
-                loss_att = F.cross_entropy(logits_att, y_tr_d)
-                loss_att.backward()
-                opt.step()
-            with torch.no_grad():
-                val_logits = h_val.to(att_dev) @ w_u_att + b_u_att
-                recovery_acc = float((val_logits.argmax(dim=-1) == y_bad_val.to(att_dev)).float().mean().item())
-            del w_u_att, b_u_att, h_tr_d, y_tr_d, opt
-        finally:
-            if use_cuda_att and prev_tf32 is not None:
-                torch.backends.cuda.matmul.allow_tf32 = prev_tf32
+        del clean_cache, new_cache
 
         rel_edit = _relative_frob_edit(base_weights, cand)
         s_surgical = max(0.0, 1.0 - min(1.0, rel_edit))
-        anti_mask_ok = bool(proj_ratio < 0.05 and recovery_acc <= 0.25)
+        rec_cap = max(0.25, float(secret.get("baseline_recovery_acc", 0.0)) + 0.08)
+        anti_mask_ok = bool(proj_ratio < 0.05 and recovery_acc <= rec_cap)
         s_task = (0.5 * clean_acc + 0.5 * trig_keep_acc) * (1.0 if anti_mask_ok else 0.25)
         passed = bool(clean_acc >= 0.99 and trig_keep_acc >= 0.99 and anti_mask_ok)
         reward = _compute_unified_reward(s_task, 0.0, s_surgical, stats)
@@ -330,6 +401,7 @@ def _verify_core(
                 "trig_keep_acc": round(trig_keep_acc, 4),
                 "internal_trojan_proj_ratio": round(proj_ratio, 6),
                 "recovery_attack_acc": round(recovery_acc, 4),
+                "recovery_attack_cap": round(rec_cap, 4),
                 "relative_frobenius_edit": round(rel_edit, 6),
                 "forward_batches_used": int(stats.get("forward_passes_used", 0)),
             },
