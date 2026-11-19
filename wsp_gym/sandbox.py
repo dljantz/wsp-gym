@@ -35,16 +35,20 @@ SYSTEM_PROMPT = (
     "within your forward-pass and turn budgets.\n\n"
     "Pre-loaded variables & helpers:\n"
     "- `config`: ModelConfig dict; `brief_md`: task brief string; `weights`: editable state_dict; `orig_weights`: read-only clone; `weights_B` (Cat 6 only).\n"
-    "- `probe_forward(input_ids, custom_weights=None, return_cache=True)`: consumes 1 forward batch (max batch=32). "
+    "- `probe_forward(input_ids, custom_weights=None, return_cache=True, cache_keys=None)`: consumes 1 forward batch (max batch=32). "
     "Returns `(logits, cache)` when `return_cache=True`, or `logits` tensor alone when `return_cache=False`.\n"
     "- `submit_weights(candidate_weights)`: queues `candidate_weights` dict for verification and ends the episode.\n"
     "- `submit_decompiled(result_dict)`: queues decompiled specification dict (Cat 1) and ends the episode.\n"
     "- `wsp_tools`: pre-loaded toolkit with `residual_svd_basis(weights, config=None, tol=1e-4, include_embeddings=True)`, "
+    "`covariance_nullspace(weights, config, layer='final', calib_tokens=None, tol_ratio=1e-4, site='resid_mid')` "
+    "(returns `V_null` ascending by empirical variance/sensitivity and `sqrt_cov` for full-rank models), "
+    "`batched_head_svdvals(weights, layers=None, proj='W_O', config=None)`, "
     "`head_offset_profile(weights, layer=0, query_pos=6, max_offset=8)`, `rope_rotation_matrix(d_head, offset)`, "
     "`virtual_ov_circuit(weights, layer=0, head=None)`, `mlp_logit_impact(weights, layer=0, tol=1e-4)`, "
     "`canonical_pack(weights, ...)`, and `layer_anomaly_scan(weights, config=None, top_k=3)`.\n"
     "- GQA / deep-model notes: `W_K`/`W_V` have shape `(n_kv_heads, d_model, d_head)` when `n_kv_heads < n_heads` "
-    "(group size `n_heads // n_kv_heads`), optional `b_Q`/`b_K`/`b_V` may exist, and `layer_anomaly_scan` inspects all layers compactly."
+    "(group size `n_heads // n_kv_heads`), optional `b_Q`/`b_K`/`b_V` may exist. On large models (`B > 0`), narrow candidates "
+    "statically first (`layer_anomaly_scan`, `batched_head_svdvals`, `cache_keys`) before calling `probe_forward`."
 )
 
 
@@ -163,30 +167,59 @@ def _compact_views(val: Any, depth: int = 0) -> Any:
     return val
 
 
-def _cgroup_mem_ceiling_bytes(ratio: float = 0.84) -> tuple[Path, int] | None:
-    """Return (memory_stat_path, soft_anon_ceiling_bytes) inside a finite cgroup v2 limit."""
-    max_path = Path("/sys/fs/cgroup/memory.max")
-    stat_path = Path("/sys/fs/cgroup/memory.stat")
+def _cgroup_mem_ceiling_bytes(ratio: float = 0.80) -> tuple[Path, int] | None:
+    """Return (memory_stat_path, soft_anon_ceiling_bytes) inside a finite cgroup v2 or v1 limit."""
+    v2_max = Path("/sys/fs/cgroup/memory.max")
+    v2_stat = Path("/sys/fs/cgroup/memory.stat")
     try:
-        if not (max_path.exists() and stat_path.exists()):
-            return None
-        raw_max = max_path.read_text(encoding="utf-8").strip()
-        if not raw_max or raw_max == "max":
-            return None
-        limit_bytes = int(raw_max)
-        if limit_bytes <= 0 or limit_bytes >= (1 << 60):
-            return None
-        return stat_path, int(limit_bytes * float(ratio))
-    except OSError:
-        return None
+        if v2_max.exists() and v2_stat.exists():
+            raw_max = v2_max.read_text(encoding="utf-8").strip()
+            if raw_max and raw_max != "max":
+                limit_bytes = int(raw_max)
+                if 0 < limit_bytes < (1 << 60):
+                    return v2_stat, int(limit_bytes * float(ratio))
+    except (OSError, ValueError):
+        pass
+
+    v1_lim = Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+    v1_stat = Path("/sys/fs/cgroup/memory/memory.stat")
+    try:
+        if v1_lim.exists() and v1_stat.exists():
+            limits: list[int] = []
+            raw_lim = v1_lim.read_text(encoding="utf-8").strip()
+            if raw_lim:
+                val = int(raw_lim)
+                if 0 < val < (1 << 60):
+                    limits.append(val)
+            for line in v1_stat.read_text(encoding="utf-8").splitlines():
+                if line.startswith("hierarchical_memory_limit "):
+                    hval = int(line.split()[1])
+                    if 0 < hval < (1 << 60):
+                        limits.append(hval)
+                    break
+            if limits:
+                return v1_stat, int(min(limits) * float(ratio))
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
 
 
 def _read_cgroup_anon_bytes(stat_path: Path) -> int:
-    """Read non-reclaimable anonymous RAM usage in bytes from cgroup v2 memory.stat."""
+    """Read non-reclaimable anonymous/RSS RAM usage in bytes from cgroup v2 or v1 memory.stat."""
     try:
+        total_rss: int | None = None
+        rss: int | None = None
         for line in stat_path.read_text(encoding="utf-8").splitlines():
             if line.startswith("anon "):
                 return int(line.split()[1])
+            if line.startswith("total_rss "):
+                total_rss = int(line.split()[1])
+            elif line.startswith("rss "):
+                rss = int(line.split()[1])
+        if total_rss is not None:
+            return total_rss
+        if rss is not None:
+            return rss
     except (OSError, ValueError, IndexError):
         return 0
     return 0
@@ -273,7 +306,11 @@ class SandboxSession:
         obj.config = bundle.config
         obj.brief_md = bundle.brief_md
         extra = {
-            name: {k: v.detach().clone() for k, v in w_dict.items()}
+            name: (
+                w_dict.fork()
+                if isinstance(w_dict, LazyTwinWeightDict)
+                else {k: v.detach().clone() for k, v in w_dict.items()}
+            )
             for name, w_dict in (bundle.extra_public_weights or {}).items()
         }
         obj.state = {
@@ -360,6 +397,7 @@ class SandboxSession:
             input_ids: torch.Tensor,
             custom_weights: dict[str, torch.Tensor] | None = None,
             return_cache: bool = True,
+            cache_keys: set[str] | list[str] | tuple[str, ...] | None = None,
         ):
             if self.state["forward_budget_remaining"] <= 0:
                 raise RuntimeError("Forward pass budget exhausted (0 remaining).")
@@ -372,8 +410,15 @@ class SandboxSession:
             self.state["forward_budget_remaining"] -= 1
             self.state["forward_passes_used"] += 1
             target_w = self.state["weights"] if custom_weights is None else custom_weights
+            resolved_keys = None if cache_keys is None else set(cache_keys)
             with torch.no_grad():
-                return forward_fast(input_ids, target_w, self.config, return_cache=return_cache)
+                return forward_fast(
+                    input_ids,
+                    target_w,
+                    self.config,
+                    return_cache=return_cache,
+                    cache_keys=resolved_keys,
+                )
 
         def submit_weights(candidate_weights: dict[str, torch.Tensor]) -> None:
             turn_submission["type"] = "weights"
@@ -445,8 +490,10 @@ class SandboxSession:
             return _trace_timeout
 
         prev_trace = sys.gettrace()
+        t_exec_start = time.perf_counter()
+        exec_elapsed_sec = 0.0
         try:
-            with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf):
+            with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf), wsp_tools.bind_sandbox_probe(probe_forward):
                 compiled = compile(code, "<sandbox>", "exec")
                 try:
                     if need_trace:
@@ -467,10 +514,17 @@ class SandboxSession:
                     env.pop(uk, None)
             if isinstance(self.state.get("weights"), LazyTwinWeightDict):
                 self.state["weights"]._cache.clear()
+                self.state["weights"]._cache_meta.clear()
+            for ew in self.state.get("extra_weights", {}).values():
+                if isinstance(ew, LazyTwinWeightDict):
+                    ew._cache.clear()
+                    ew._cache_meta.clear()
             gc.collect()
         except (Exception, SystemExit):
             exec_error = True
             traceback.print_exc(file=stderr_buf)
+        finally:
+            exec_elapsed_sec = max(0.0, time.perf_counter() - t_exec_start)
 
         # Persist updated weights & picklable user variables
         if isinstance(env.get("weights"), dict):
@@ -547,6 +601,7 @@ class SandboxSession:
             "exec_error": exec_error,
             "timed_out": timed_out,
             "explicit_submit": explicit_submit,
+            "wall_sec": round(exec_elapsed_sec, 4),
             "observation": observation,
             "submitted": self.state["submitted"],
             "verification": verification,

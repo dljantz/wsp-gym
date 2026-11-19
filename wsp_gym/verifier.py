@@ -129,11 +129,31 @@ def _relative_frob_edit(
 
 
 def _total_frob_sq(weights: dict[str, torch.Tensor]) -> float:
+    if isinstance(weights, LazyTwinWeightDict):
+        return weights.total_frob_sq()
     return sum(float((v * v).sum().item()) for v in weights.values())
 
 
 def _l0_count(weights: dict[str, torch.Tensor], thresh: float = 1e-4) -> int:
+    if isinstance(weights, LazyTwinWeightDict):
+        return weights.total_l0_count(thresh=thresh)
     return sum(int((v.abs() > thresh).sum().item()) for v in weights.values())
+
+
+def _scoped_frob_and_l0(
+    weights: dict[str, torch.Tensor],
+    keys: list[str],
+    thresh: float = 1e-4,
+) -> tuple[float, int]:
+    if isinstance(weights, LazyTwinWeightDict):
+        weights.flush()
+    frob_sq = 0.0
+    l0 = 0
+    for k in keys:
+        t = weights.raw_tensor(k) if isinstance(weights, LazyTwinWeightDict) else weights[k]
+        frob_sq += float(t.detach().norm(dtype=torch.float32).item()) ** 2
+        l0 += int((t.detach().abs() > thresh).sum().item())
+    return frob_sq, l0
 
 
 def _compute_unified_reward(
@@ -411,18 +431,35 @@ def _verify_core(
         acc_a = _last_token_acc(secret["eval_A_x"], secret["eval_A_y"], cand, config)
         acc_b = _last_token_acc(secret["eval_B_x"], secret["eval_B_y"], cand, config)
         s_task = min(acc_a, acc_b) * 0.5 + (acc_a + acc_b) * 0.25
-        sparsity = 1.0 - (_l0_count(cand) / max(1, sum(v.numel() for v in cand.values())))
         passed = bool(acc_a >= 0.99 and acc_b >= 0.99)
-        reward = _compute_unified_reward(s_task, 0.0, sparsity, stats)
-        return {
-            "passed": passed,
-            "total_reward": round(reward, 6),
-            "metrics": {
+        if secret.get("surgical_mode") == "relative_edit":
+            rel_edit = _relative_frob_edit(base_weights, cand)
+            s_surgical = max(0.0, 1.0 - min(1.0, rel_edit))
+            metrics_c6: dict[str, Any] = {
+                "task_A_acc": round(acc_a, 4),
+                "task_B_acc": round(acc_b, 4),
+                "relative_frobenius_edit": round(rel_edit, 6),
+                "forward_batches_used": int(stats.get("forward_passes_used", 0)),
+            }
+        else:
+            total_numel = (
+                cand.num_parameters()
+                if isinstance(cand, LazyTwinWeightDict)
+                else sum(v.numel() for v in cand.values())
+            )
+            sparsity = 1.0 - (_l0_count(cand) / max(1, total_numel))
+            s_surgical = sparsity
+            metrics_c6 = {
                 "task_A_acc": round(acc_a, 4),
                 "task_B_acc": round(acc_b, 4),
                 "weight_sparsity": round(sparsity, 4),
                 "forward_batches_used": int(stats.get("forward_passes_used", 0)),
-            },
+            }
+        reward = _compute_unified_reward(s_task, 0.0, s_surgical, stats)
+        return {
+            "passed": passed,
+            "total_reward": round(reward, 6),
+            "metrics": metrics_c6,
         }
 
     if category == "cat7_refactor":
@@ -436,6 +473,43 @@ def _verify_core(
             )
             new_logits = forward_fast(eval_x, cand, config)
             max_diff = float((orig_logits - new_logits).abs().max().item())
+
+        if "compress_keys" in secret:
+            c_keys = [str(k) for k in secret["compress_keys"]]
+            orig_last = orig_logits[:, -1, :] if orig_logits.ndim == 3 else orig_logits
+            new_last = new_logits[:, -1, :] if new_logits.ndim == 3 else new_logits
+            eval_kl = _kl_last_token_from_logits(orig_last, new_last)
+            top1_agree = float((orig_last.argmax(dim=-1) == new_last.argmax(dim=-1)).float().mean().item())
+            orig_scope_frob, orig_scope_l0 = _scoped_frob_and_l0(orig_w, c_keys)
+            new_scope_frob, new_scope_l0 = _scoped_frob_and_l0(cand, c_keys)
+            frob_ratio = new_scope_frob / max(1e-8, orig_scope_frob)
+            l0_ratio = new_scope_l0 / max(1, orig_scope_l0)
+
+            max_eval_kl = float(secret.get("max_eval_kl", 0.004))
+            min_top1 = float(secret.get("min_top1_agree", 0.9375))
+            max_l0_ratio = float(secret.get("max_l0_ratio", 0.60))
+            max_frob_ratio = float(secret.get("max_frob_ratio", 0.90))
+
+            equiv_ok = bool(eval_kl <= max_eval_kl and top1_agree >= min_top1)
+            compression_ok = bool(l0_ratio <= max_l0_ratio and frob_ratio <= max_frob_ratio)
+            s_task = min(1.0, top1_agree) if equiv_ok else max(0.0, math.exp(-20.0 * eval_kl))
+            s_surgical = max(0.0, 1.0 - l0_ratio)
+            passed = bool(equiv_ok and compression_ok)
+            reward = _compute_unified_reward(s_task, eval_kl, s_surgical, stats, beta_kl=20.0)
+            if l0_ratio >= 0.95 and not passed:
+                reward = min(reward, 0.0)
+            return {
+                "passed": passed,
+                "total_reward": round(reward, 6),
+                "metrics": {
+                    "eval_kl_div": round(eval_kl, 8),
+                    "top1_agreement": round(top1_agree, 4),
+                    "max_abs_logit_diff": round(max_diff, 6),
+                    "frob_sq_ratio": round(frob_ratio, 4),
+                    "l0_ratio": round(l0_ratio, 4),
+                    "forward_batches_used": int(stats.get("forward_passes_used", 0)),
+                },
+            }
 
         orig_frob = float(secret["orig_frob"]) if "orig_frob" in secret else _total_frob_sq(orig_w)
         new_frob = _total_frob_sq(cand)

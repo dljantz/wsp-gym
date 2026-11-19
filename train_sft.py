@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -359,6 +360,32 @@ def run_sft_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
     global_step = 0
     loss_history: list[float] = []
     micro_step = 0
+    step_loss_accum = 0.0
+    step_loss_count = 0
+
+    log_path_arg = getattr(args, "log_path", None)
+    log_path_obj: Path | None = Path(log_path_arg) if log_path_arg else None
+    if log_path_obj is not None:
+        log_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        log_path_obj.write_text("", encoding="utf-8")
+
+    def _emit_step_log(epoch_idx: int, step_loss: float) -> None:
+        lr_val = float(scheduler.get_last_lr()[0])
+        if log_path_obj is not None:
+            row = {
+                "step": global_step,
+                "epoch": epoch_idx + 1,
+                "loss": round(step_loss, 6),
+                "lr": lr_val,
+            }
+            with log_path_obj.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+        if global_step == 1 or global_step % 25 == 0 or global_step == total_optim_steps:
+            print(
+                f"[train_sft step {global_step}/{total_optim_steps}] epoch={epoch_idx + 1} loss={step_loss:.6f} lr={lr_val:.2e}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     for _epoch in range(int(args.epochs)):
         for batch in loader:
@@ -366,7 +393,10 @@ def run_sft_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
             out = model(**batch)
             raw_loss = out.loss
             (raw_loss / grad_accum).backward()
-            loss_history.append(float(raw_loss.detach().item()))
+            loss_val = float(raw_loss.detach().item())
+            loss_history.append(loss_val)
+            step_loss_accum += loss_val
+            step_loss_count += 1
             micro_step += 1
 
             if micro_step % grad_accum == 0:
@@ -375,6 +405,9 @@ def run_sft_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                _emit_step_log(_epoch, step_loss_accum / max(1, step_loss_count))
+                step_loss_accum = 0.0
+                step_loss_count = 0
 
     if micro_step % grad_accum != 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -382,6 +415,7 @@ def run_sft_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         global_step += 1
+        _emit_step_log(max(0, int(args.epochs) - 1), step_loss_accum / max(1, step_loss_count))
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -404,6 +438,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Turn-masked LoRA SFT warmup for WSP-Gym.")
     parser.add_argument("--sft-path", default="trajectories/sft_train.jsonl")
     parser.add_argument("--output-dir", default="checkpoints/sft_lora")
+    parser.add_argument("--log-path", default=None)
     parser.add_argument("--model-name-or-path", default="Qwen/Qwen2.5-Coder-7B-Instruct")
     parser.add_argument("--max-length", type=int, default=4096)
     parser.add_argument("--batch-size", type=int, default=1)

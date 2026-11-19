@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import json
 import math
+import os
 from pathlib import Path
 import random
 from typing import Any
@@ -19,7 +20,7 @@ from wsp_gym.level2 import (
     _guard_hf_transfer,
     _trim_host_ram,
 )
-from wsp_gym.model import LazyTwinWeightDict, ModelConfig, forward_fast, init_weights
+from wsp_gym.model import LazyTwinWeightDict, ModelConfig, _apply_norm, forward_fast, init_weights
 from wsp_gym.toolkit import rope_rotation_matrix
 from wsp_gym.verifier import (
     _kl_last_token_from_logits,
@@ -34,6 +35,28 @@ LEVEL3_SUBTYPES: tuple[tuple[str, str], ...] = (
     ("cat2_repair", "self_twin_qwen25_coder_7b_sink_repair"),
     ("cat2_repair", "self_twin_qwen25_coder_7b_multi_sink_repair"),
     ("cat5_unlearn_excise", "self_twin_qwen25_coder_7b_backdoor_excise"),
+)
+
+LEVEL3_CONSTRUCTIVE_SUBTYPES: tuple[tuple[str, str], ...] = (
+    ("cat4_nullspace_inject", "self_twin_qwen25_coder_7b_nullspace_inject"),
+    ("cat6_splice_merge", "self_twin_qwen25_coder_7b_specialist_merge"),
+    ("cat7_refactor", "self_twin_qwen25_coder_7b_svd_compress"),
+)
+
+ALL_LEVEL3_SUBTYPES: tuple[tuple[str, str], ...] = (
+    LEVEL3_SUBTYPES + LEVEL3_CONSTRUCTIVE_SUBTYPES
+)
+
+PHASE4_SYNTH_CONSTRUCTIVE_SUBTYPES: tuple[tuple[str, str], ...] = (
+    ("cat4_nullspace_inject", "synth_fullrank_gqa_nullspace_inject"),
+    ("cat6_splice_merge", "synth_fullrank_gqa_specialist_merge"),
+    ("cat7_refactor", "synth_fullrank_gqa_svd_compress"),
+)
+
+PHASE4_SYNTH_RESTORATIVE_SUBTYPES: tuple[tuple[str, str], ...] = (
+    ("cat2_repair", "synth_fullrank_gqa_sink_repair"),
+    ("cat2_repair", "synth_fullrank_gqa_multi_sink_repair"),
+    ("cat5_unlearn_excise", "synth_fullrank_gqa_backdoor_excise"),
 )
 
 _SELF_TWIN_CACHE: dict[str, tuple[ModelConfig, LazyTwinWeightDict, Any]] = {}
@@ -107,11 +130,83 @@ class _MiniTokenizer:
         return out
 
 
+def _build_anisotropic_fullrank_twin(
+    config: ModelConfig,
+    seed: int = 0,
+    dtype: torch.dtype = torch.bfloat16,
+) -> LazyTwinWeightDict:
+    """Build a full-rank (`rank == d_model`) anisotropic GQA LazyTwinWeightDict with low-curvature tail."""
+    gen = torch.Generator(device="cpu").manual_seed(seed + 4242)
+    d_model = int(config.d_model)
+    d_head = int(config.d_head)
+    n_kv = config.effective_kv_heads()
+    gs = int(config.n_heads) // n_kv
+
+    base_f32 = init_weights(config, seed=seed + 101, scale=0.05)
+    q_raw = torch.randn((d_model, d_model), generator=gen, dtype=torch.float32)
+    q_aniso, r_q = torch.linalg.qr(q_raw)
+    signs_q = torch.where(torch.diag(r_q) >= 0, 1.0, -1.0)
+    q_aniso = q_aniso * signs_q.unsqueeze(0)
+
+    tail_dim = min(max(36, d_model // 4), d_model - 16)
+    n_act = d_model - tail_dim
+    s_res = torch.empty(d_model, dtype=torch.float32)
+    s_res[:n_act] = torch.linspace(1.3, 0.30, n_act)
+    s_res[n_act:] = torch.linspace(0.005, 0.003, tail_dim)
+
+    m_right = s_res.unsqueeze(1) * q_aniso.T  # (d_model, d_model): right-multiply writers
+    m_left = q_aniso * s_res.unsqueeze(0)     # (d_model, d_model): left-multiply readers
+
+    base_f32["W_E"] = base_f32["W_E"] @ m_right
+    base_f32["W_U"] = m_left @ base_f32["W_U"]
+    base_f32["norm_final.weight"] = 0.6 + 2.0 * torch.rand((d_model,), generator=gen)
+    base_f32["norm_final.weight"][0] = -1.4
+    base_f32["norm_final.weight"][1] = -0.18
+
+    d_decay = (torch.arange(d_head, dtype=torch.float32) + 1.0).pow(-1.48)
+    d_decay = d_decay / d_decay.norm().clamp_min(1e-8) * math.sqrt(float(d_head))
+    d_decay_sqrt = d_decay.sqrt()
+
+    for l in range(config.n_layers):
+        p = f"blocks.{l}"
+        base_f32[f"{p}.norm1.weight"] = 0.8 + 0.4 * torch.rand((d_model,), generator=gen)
+        base_f32[f"{p}.norm2.weight"] = 0.8 + 0.4 * torch.rand((d_model,), generator=gen)
+        base_f32[f"{p}.attn.W_Q"] = torch.einsum("ab,hbc->hac", m_left, base_f32[f"{p}.attn.W_Q"])
+        base_f32[f"{p}.attn.W_K"] = torch.einsum("ab,kbc->kac", m_left, base_f32[f"{p}.attn.W_K"])
+        base_f32[f"{p}.attn.b_Q"] = torch.randn((config.n_heads, d_head), generator=gen) * 0.04
+        base_f32[f"{p}.attn.b_K"] = torch.randn((n_kv, d_head), generator=gen) * 0.04
+        b_v_raw = torch.randn((n_kv, d_head), generator=gen) * 0.04
+
+        w_v_l = torch.einsum("ab,kbc->kac", m_left, base_f32[f"{p}.attn.W_V"])
+        w_o_l = torch.einsum("hbc,cd->hbd", base_f32[f"{p}.attn.W_O"], m_right)
+        for kv in range(n_kv):
+            rh_raw = torch.randn((d_head, d_head), generator=gen, dtype=torch.float32)
+            r_head, _ = torch.linalg.qr(rh_raw)
+            w_v_l[kv] = (w_v_l[kv] * d_decay_sqrt.unsqueeze(0)) @ r_head.T
+            b_v_raw[kv] = (b_v_raw[kv] * d_decay_sqrt) @ r_head.T
+            for h in range(kv * gs, (kv + 1) * gs):
+                w_o_l[h] = r_head @ (d_decay_sqrt.unsqueeze(1) * w_o_l[h])
+        base_f32[f"{p}.attn.W_V"] = w_v_l
+        base_f32[f"{p}.attn.W_O"] = w_o_l
+        base_f32[f"{p}.attn.b_V"] = b_v_raw
+
+        base_f32[f"{p}.mlp.W_in"] = m_left @ base_f32[f"{p}.mlp.W_in"]
+        if f"{p}.mlp.W_gate" in base_f32:
+            base_f32[f"{p}.mlp.W_gate"] = m_left @ base_f32[f"{p}.mlp.W_gate"]
+        base_f32[f"{p}.mlp.W_out"] = base_f32[f"{p}.mlp.W_out"] @ m_right
+
+    base_typed = {k: v.to(dtype=dtype).contiguous() for k, v in base_f32.items()}
+    base_finite = all(bool(torch.isfinite(t).all().item()) for t in base_typed.values())
+    lazy = LazyTwinWeightDict(base_typed, max_cache=12, base_verified_finite=base_finite)
+    lazy.base_frob_sq()
+    return lazy
+
+
 def mini_self_twin_wsp(
     seed: int = 0,
     dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[ModelConfig, LazyTwinWeightDict, _MiniTokenizer]:
-    """Build a synthetic 7:1 GQA `bfloat16` LazyTwinWeightDict matching Qwen2.5-Coder geometry."""
+    """Build a synthetic full-rank 7:1 GQA `bfloat16` LazyTwinWeightDict matching Qwen2.5-Coder geometry."""
     config = ModelConfig(
         vocab_size=512,
         max_seq_len=64,
@@ -130,21 +225,72 @@ def mini_self_twin_wsp(
         rope_theta=1_000_000.0,
         attn_bias=True,
     )
-    gen = torch.Generator(device="cpu").manual_seed(seed + 4242)
-    base_f32 = init_weights(config, seed=seed + 101, scale=0.05)
-    base_f32["norm_final.weight"] = 0.6 + 2.2 * torch.rand((config.d_model,), generator=gen)
-    for l in range(config.n_layers):
-        p = f"blocks.{l}"
-        base_f32[f"{p}.norm1.weight"] = 0.8 + 0.4 * torch.rand((config.d_model,), generator=gen)
-        base_f32[f"{p}.norm2.weight"] = 0.8 + 0.4 * torch.rand((config.d_model,), generator=gen)
-        base_f32[f"{p}.attn.b_Q"] = torch.randn((config.n_heads, config.d_head), generator=gen) * 0.04
-        base_f32[f"{p}.attn.b_K"] = torch.randn((config.effective_kv_heads(), config.d_head), generator=gen) * 0.04
-        base_f32[f"{p}.attn.b_V"] = torch.randn((config.effective_kv_heads(), config.d_head), generator=gen) * 0.04
-    base_typed = {k: v.to(dtype=dtype).contiguous() for k, v in base_f32.items()}
-    base_finite = all(bool(torch.isfinite(t).all().item()) for t in base_typed.values())
-    lazy = LazyTwinWeightDict(base_typed, max_cache=12, base_verified_finite=base_finite)
-    lazy.base_frob_sq()
+    lazy = _build_anisotropic_fullrank_twin(config, seed=seed, dtype=dtype)
     return config, lazy, _MiniTokenizer(config.vocab_size)
+
+
+def synth_fullrank_twin_wsp(
+    seed: int = 0,
+    dtype: torch.dtype = torch.bfloat16,
+) -> tuple[ModelConfig, LazyTwinWeightDict, _MiniTokenizer]:
+    """Build synthetic 4M-38M full-rank anisotropic GQA twins (`0` real LLM weights) for Phase 4 training."""
+    specs = (
+        (6, 8, 2, 1024, True, 10_000.0),
+        (10, 9, 3, 1536, False, 100_000.0),
+        (12, 12, 4, 2048, True, 10_000.0),
+        (16, 14, 2, 3072, True, 100_000.0),
+        (18, 9, 3, 2048, False, 100_000.0),
+        (20, 14, 2, 2048, True, 1_000_000.0),
+    )
+    n_layers, n_heads, n_kv, vocab_size, attn_bias, rope_theta = specs[int(seed) % len(specs)]
+    d_head = 16 if n_layers >= 18 else 32
+    d_model = n_heads * d_head
+    d_mlp = 3 * d_model
+    config = ModelConfig(
+        vocab_size=vocab_size,
+        max_seq_len=32,
+        n_layers=n_layers,
+        d_model=d_model,
+        n_heads=n_heads,
+        n_kv_heads=n_kv,
+        d_head=d_head,
+        d_mlp=d_mlp,
+        norm_type="rmsnorm",
+        mlp_type="swiglu",
+        act_type="silu",
+        pos_type="rope",
+        causal=True,
+        rms_eps=1e-6,
+        rope_theta=rope_theta,
+        attn_bias=attn_bias,
+    )
+    lazy = _build_anisotropic_fullrank_twin(config, seed=seed, dtype=dtype)
+    return config, lazy, _MiniTokenizer(config.vocab_size)
+
+
+def _evict_safetensors_page_cache(model_or_dir: str | Path) -> None:
+    """Drop read-only `.safetensors` OS page cache entries to stay well under cgroup v1/v2 limits."""
+    if not hasattr(os, "posix_fadvise") or not hasattr(os, "POSIX_FADV_DONTNEED"):
+        return
+    try:
+        candidate = Path(model_or_dir)
+        if not candidate.is_dir():
+            from huggingface_hub import snapshot_download
+
+            candidate = Path(snapshot_download(str(model_or_dir), local_files_only=True))
+    except Exception:
+        return
+    if not candidate.is_dir():
+        return
+    for st_file in sorted(candidate.glob("*.safetensors")):
+        try:
+            fd = os.open(str(st_file), os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
 
 
 def load_self_twin_as_wsp(
@@ -267,6 +413,7 @@ def load_self_twin_as_wsp(
     )
     lazy_twin = LazyTwinWeightDict(raw_base, max_cache=6, base_verified_finite=base_finite)
     lazy_twin.base_frob_sq()
+    _evict_safetensors_page_cache(snap_dir)
     _trim_host_ram()
     if use_cache:
         _SELF_TWIN_CACHE[model_id] = (config, lazy_twin, tokenizer)
@@ -385,14 +532,7 @@ def generate_level3_cat2_sink(
 ) -> ChallengeBundle:
     """Level 3 Cat 2: Single or compound dual-layer SwiGLU sink attractor on immutable 7B/mini twin."""
     rng = random.Random(seed)
-    if scale == "mini":
-        config, clean_twin, tokenizer = mini_self_twin_wsp(seed=seed)
-        model_label = "mini_qwen25_7b_twin"
-    elif scale == "7b":
-        config, clean_twin, tokenizer = load_self_twin_as_wsp(LEVEL3_SELF_TWIN_MODEL, use_cache=True)
-        model_label = LEVEL3_SELF_TWIN_MODEL
-    else:
-        raise ValueError(f"Unknown Level 3 scale: {scale!r}")
+    config, clean_twin, tokenizer, model_label = _load_twin_for_scale(scale, seed)
 
     eval_id_x, eval_id_y = _build_self_prompt_batches(tokenizer, clean_twin, config, seed + 1, 16, 10)
     eval_ood_x, eval_ood_y = _build_self_prompt_batches(tokenizer, clean_twin, config, seed + 2, 16, 20)
@@ -409,11 +549,19 @@ def generate_level3_cat2_sink(
         l1 = rng.randint(max(1, config.n_layers // 4), max(2, config.n_layers // 2 - 1))
         l2 = rng.randint(max(l1 + 1, config.n_layers // 2), config.n_layers - 2)
         layer_sinks = [(l1, sink_toks[0]), (l2, sink_toks[1 % len(sink_toks)])]
-        subtype = "self_twin_qwen25_coder_7b_multi_sink_repair"
+        subtype = (
+            "synth_fullrank_gqa_multi_sink_repair"
+            if scale == "synth"
+            else "self_twin_qwen25_coder_7b_multi_sink_repair"
+        )
     else:
         l1 = rng.randint(max(1, config.n_layers // 4), config.n_layers - 2)
         layer_sinks = [(l1, sink_toks[0])]
-        subtype = "self_twin_qwen25_coder_7b_sink_repair"
+        subtype = (
+            "synth_fullrank_gqa_sink_repair"
+            if scale == "synth"
+            else "self_twin_qwen25_coder_7b_sink_repair"
+        )
 
     nf = _get_f32_tensor(clean_twin, "norm_final.weight")
     snf = torch.where(nf < 0, -nf.abs().clamp_min(1e-6), nf.abs().clamp_min(1e-6))
@@ -519,14 +667,7 @@ def generate_level3_cat5_backdoor(
     forward_budget: int | None = None,
 ) -> ChallengeBundle:
     """Level 3 Cat 5: 7:1 GQA + SwiGLU sleeper backdoor excision on immutable 7B/mini twin."""
-    if scale == "mini":
-        config, clean_twin, tokenizer = mini_self_twin_wsp(seed=seed)
-        model_label = "mini_qwen25_7b_twin"
-    elif scale == "7b":
-        config, clean_twin, tokenizer = load_self_twin_as_wsp(LEVEL3_SELF_TWIN_MODEL, use_cache=True)
-        model_label = LEVEL3_SELF_TWIN_MODEL
-    else:
-        raise ValueError(f"Unknown Level 3 scale: {scale!r}")
+    config, clean_twin, tokenizer, model_label = _load_twin_for_scale(scale, seed)
 
     d_model = config.d_model
     d_head = config.d_head
@@ -766,10 +907,15 @@ def generate_level3_cat5_backdoor(
         f"Locate and excise both the internal backdoor MLP neuron(s) and its upstream trigger attention heads across all layers without harming clean behavior.\n\n"
         f"Call `submit_weights(weights)` when complete.\n"
     )
+    subtype = (
+        "synth_fullrank_gqa_backdoor_excise"
+        if scale == "synth"
+        else "self_twin_qwen25_coder_7b_backdoor_excise"
+    )
     return ChallengeBundle(
         episode_id=f"ep_l3_{scale}_cat5_{seed}",
         category="cat5_unlearn_excise",
-        subtype="self_twin_qwen25_coder_7b_backdoor_excise",
+        subtype=subtype,
         difficulty=3.0,
         forward_budget=budget,
         config=config,
@@ -795,19 +941,632 @@ def generate_level3_cat5_backdoor(
     )
 
 
+def _load_twin_for_scale(
+    scale: str,
+    seed: int,
+) -> tuple[ModelConfig, LazyTwinWeightDict, Any, str]:
+    if scale == "mini":
+        config, clean_twin, tokenizer = mini_self_twin_wsp(seed=seed)
+        return config, clean_twin, tokenizer, "mini_qwen25_7b_twin"
+    if scale == "synth":
+        config, clean_twin, tokenizer = synth_fullrank_twin_wsp(seed=seed)
+        label = (
+            f"synth_fullrank_gqa_{config.n_layers}l_{config.n_heads}h"
+            f"{config.effective_kv_heads()}kv"
+        )
+        return config, clean_twin, tokenizer, label
+    if scale == "7b":
+        config, clean_twin, tokenizer = load_self_twin_as_wsp(LEVEL3_SELF_TWIN_MODEL, use_cache=True)
+        return config, clean_twin, tokenizer, LEVEL3_SELF_TWIN_MODEL
+    raise ValueError(f"Unknown Level 3 scale: {scale!r}")
+
+
+def _pick_disjoint_domain_tokens(
+    vocab_size: int,
+    count: int,
+    used_toks: set[int],
+) -> list[int]:
+    hi = min(int(vocab_size) - 2, 148_000) if int(vocab_size) > 150_000 else int(vocab_size) - 2
+    lo = 220
+    excluded = set(used_toks) | set(range(16, 210))
+    for base in range(hi - int(count) + 1, lo - 1, -1):
+        cand = list(range(base, base + int(count)))
+        if all(t not in excluded for t in cand):
+            return cand
+    out = [t for t in range(hi, 12, -1) if t not in excluded][: int(count)]
+    if len(out) < int(count):
+        raise RuntimeError(f"Insufficient disjoint domain tokens in vocab_size={vocab_size}.")
+    return sorted(out)
+
+
+def _rademacher3_codes(m: int = 8) -> torch.Tensor:
+    rows = []
+    inv_s = 1.0 / math.sqrt(3.0)
+    for v in range(m):
+        rows.append(
+            [
+                inv_s * (1.0 if (v & 1) else -1.0),
+                inv_s * (1.0 if (v & 2) else -1.0),
+                inv_s * (1.0 if (v & 4) else -1.0),
+            ]
+        )
+    return torch.tensor(rows, dtype=torch.float32)
+
+
+def _low_variance_dirs(
+    cn: dict[str, Any],
+    total_cols: int,
+    offset: int = 0,
+) -> torch.Tensor:
+    vn = cn["V_null"]
+    if int(vn.shape[1]) >= int(total_cols):
+        return vn[:, int(offset) : int(total_cols)]
+    need = int(total_cols) - int(vn.shape[1])
+    va = cn["V_active"]
+    extra = va[:, max(0, int(va.shape[1]) - need) :].flip(1)
+    combined = torch.cat([vn, extra], dim=1)
+    return combined[:, int(offset) : int(total_cols)]
+
+
+def _cast_dirty_to_base_dtype(twin: LazyTwinWeightDict) -> None:
+    twin.flush()
+    for k, v in list(twin._dirty.items()):
+        if isinstance(v, torch.Tensor) and k in twin._base and isinstance(twin._base[k], torch.Tensor):
+            target_dt = twin._base[k].dtype
+            if v.dtype != target_dt:
+                twin._dirty[k] = v.to(dtype=target_dt)
+
+
+def _inject_fullrank_modular_skill(
+    weights: LazyTwinWeightDict | dict[str, torch.Tensor],
+    config: ModelConfig,
+    tok_base: int,
+    op_tok: int,
+    a: int,
+    b: int,
+    m_mod: int = 8,
+    cn_n1: dict[str, Any] | None = None,
+    cn_n2: dict[str, Any] | None = None,
+    cn_f: dict[str, Any] | None = None,
+    calib_tokens: torch.Tensor | None = None,
+    h_tgt: int | None = None,
+    js_tgt: list[int] | None = None,
+    sub_offset: int = 0,
+    q_mix: torch.Tensor | None = None,
+    q_mix_f: torch.Tensor | None = None,
+) -> None:
+    """Inject a disjoint modular skill into low-curvature residual directions at `l_last`."""
+    ll = int(config.n_layers) - 1
+    d_model = int(config.d_model)
+    d_head = int(config.d_head)
+    n_heads = int(config.n_heads)
+    n_kv = config.effective_kv_heads()
+    gs = max(1, n_heads // n_kv)
+    half = d_head // 2
+
+    if cn_n1 is None:
+        cn_n1 = wsp_tools.covariance_nullspace(weights, config, layer=ll, calib_tokens=calib_tokens, site="norm1")
+    if cn_n2 is None:
+        cn_n2 = wsp_tools.covariance_nullspace(weights, config, layer=ll, calib_tokens=calib_tokens, site="norm2")
+    if cn_f is None:
+        cn_f = wsp_tools.covariance_nullspace(weights, config, layer="final", calib_tokens=calib_tokens)
+
+    va = _low_variance_dirs(cn_n1, sub_offset + 9, offset=sub_offset)
+    vm = _low_variance_dirs(cn_n2, sub_offset + 8, offset=sub_offset)
+    vf = _low_variance_dirs(cn_f, sub_offset + m_mod, offset=sub_offset)
+
+    u_op_a = va[:, 0]
+    u_key_a = va[:, 1]
+    u_pay_a = va[:, 2:9] if q_mix is None else (va[:, 2:9] @ q_mix)
+    u_op_m = vm[:, 0]
+    u_cp_m = vm[:, 1:8] if q_mix is None else (vm[:, 1:8] @ q_mix)
+    u_y_f = vf[:, :m_mod] if q_mix_f is None else (vf[:, :m_mod] @ q_mix_f)
+
+    n1 = _get_f32_tensor(weights, f"blocks.{ll}.norm1.weight") if f"blocks.{ll}.norm1.weight" in weights else torch.ones(d_model)
+    n2 = _get_f32_tensor(weights, f"blocks.{ll}.norm2.weight") if f"blocks.{ll}.norm2.weight" in weights else torch.ones(d_model)
+    nf = _get_f32_tensor(weights, "norm_final.weight") if "norm_final.weight" in weights else torch.ones(d_model)
+
+    v1_tmp = n1 * u_op_a
+    v2_tmp = n2 * u_op_m
+    if float((v1_tmp @ v2_tmp).item()) < 0.0:
+        u_op_m = -u_op_m
+
+    vf_all = _low_variance_dirs(cn_f, 24, offset=0)
+    vf_guard = torch.cat([vf_all[:, :8], vf_all[:, 16:24]], dim=1) if int(vf_all.shape[1]) >= 24 else u_y_f
+    c_op = torch.cat(
+        [
+            (n1 * u_op_a).unsqueeze(1),
+            (n2 * u_op_m).unsqueeze(1),
+            n2.unsqueeze(1) * u_cp_m,
+            (n1 * u_key_a).unsqueeze(1),
+            nf.unsqueeze(1) * vf_guard,
+        ],
+        dim=1,
+    )
+    rhs_op = torch.zeros(int(c_op.shape[1]), dtype=torch.float32)
+    rhs_op[0] = 0.35 if d_model > 512 else 1.0
+    rhs_op[1] = 1.0
+    e_op_raw = c_op @ torch.linalg.solve(
+        c_op.T @ c_op + 1e-4 * torch.eye(int(c_op.shape[1]), dtype=torch.float32),
+        rhs_op,
+    )
+    e_op_unit = e_op_raw / e_op_raw.norm().clamp_min(1e-8)
+
+    c_pay = torch.cat(
+        [
+            (n1 * u_key_a).unsqueeze(1),
+            n1.unsqueeze(1) * u_pay_a,
+            (n1 * u_op_a).unsqueeze(1),
+            (n2 * u_op_m).unsqueeze(1),
+        ],
+        dim=1,
+    )
+    p_pay = c_pay @ torch.linalg.solve(
+        c_pay.T @ c_pay + 1e-4 * torch.eye(int(c_pay.shape[1]), dtype=torch.float32),
+        torch.eye(int(c_pay.shape[1]), dtype=torch.float32),
+    )
+    h8 = torch.tensor(
+        [[1.0 - 2.0 * ((i & j).bit_count() % 2) for j in range(1, 8)] for i in range(m_mod)],
+        dtype=torch.float32,
+    ) / math.sqrt(7.0)
+
+    wout_frob = math.sqrt(
+        sum(
+            float(_get_f32_tensor(weights, f"blocks.{l}.mlp.W_out").pow(2).sum().item())
+            for l in range(config.n_layers)
+        )
+    )
+    depth_mul = min(1.85, max(1.0, (config.n_layers / 8.0) ** 0.5)) if d_model > 512 else 1.0
+    scale_e = max(4.5, 0.45 * depth_mul * wout_frob)
+    we_mut = weights["W_E"]
+    we_mut[op_tok] = scale_e * e_op_unit
+
+    pay_vecs: list[torch.Tensor] = []
+    for v in range(m_mod):
+        vec_v = p_pay[:, 0] + p_pay[:, 1:8] @ h8[v]
+        vec_v = vec_v / vec_v.norm().clamp_min(1e-8)
+        pay_vecs.append(scale_e * vec_v)
+        we_mut[tok_base + v] = pay_vecs[-1]
+
+    u_m8 = torch.cat([u_op_m.unsqueeze(1), u_cp_m], dim=1)
+    e_m8 = n2.unsqueeze(1) * u_m8
+    p_m8 = e_m8 @ torch.linalg.solve(
+        e_m8.T @ e_m8 + 1e-4 * torch.eye(8, dtype=torch.float32),
+        torch.eye(8, dtype=torch.float32),
+    )
+    u_cp_out = p_m8[:, 1:8]
+
+    wo_l = _get_f32_tensor(weights, f"blocks.{ll}.attn.W_O")
+    if h_tgt is None:
+        h_tgt = int(wo_l.norm(dim=(1, 2)).argmin().item())
+    kv_tgt = min(n_kv - 1, h_tgt // gs)
+    wv_kv = _get_f32_tensor(weights, f"blocks.{ll}.attn.W_V")[kv_tgt]
+    wk_kv = _get_f32_tensor(weights, f"blocks.{ll}.attn.W_K")[kv_tgt]
+
+    v_score = wv_kv.pow(2).sum(dim=0) + wo_l[h_tgt].pow(2).sum(dim=1)
+    v_cols = torch.topk(v_score, 8, largest=False).indices
+    bv_k = (
+        _get_f32_tensor(weights, f"blocks.{ll}.attn.b_V")[kv_tgt, v_cols]
+        if f"blocks.{ll}.attn.b_V" in weights
+        else torch.zeros(8, dtype=torch.float32)
+    )
+    q_v = torch.linalg.svd(bv_k.unsqueeze(0), full_matrices=True)[2][1:].T
+
+    pair_e = wk_kv.pow(2).sum(dim=0)
+    if f"blocks.{ll}.attn.b_K" in weights:
+        pair_e = pair_e + _get_f32_tensor(weights, f"blocks.{ll}.attn.b_K")[kv_tgt].pow(2)
+    if f"blocks.{ll}.attn.b_Q" in weights:
+        pair_e = pair_e + _get_f32_tensor(weights, f"blocks.{ll}.attn.b_Q")[h_tgt].pow(2)
+    c_pair = int((pair_e[:half] + pair_e[half:]).argmin().item())
+    k_vec = torch.zeros(d_head, dtype=torch.float32)
+    k_vec[c_pair] = 1.0 / math.sqrt(2.0)
+    k_vec[c_pair + half] = 1.0 / math.sqrt(2.0)
+    q_vec = k_vec @ rope_rotation_matrix(d_head, 1.0, rope_theta=config.rope_theta).T
+
+    g_q = 22.0 if d_model > 512 else 5.0
+    g_k = 5.0
+    v_gain = 1.5
+    weights[f"blocks.{ll}.attn.W_Q"][h_tgt] = _get_f32_tensor(weights, f"blocks.{ll}.attn.W_Q")[h_tgt] + g_q * torch.outer(u_op_a, q_vec)
+    weights[f"blocks.{ll}.attn.W_K"][kv_tgt] = wk_kv + g_k * torch.outer(u_key_a, k_vec)
+    wv_upd = wv_kv.clone()
+    wv_upd[:, v_cols] = wv_upd[:, v_cols] + v_gain * (u_pay_a @ q_v.T)
+    weights[f"blocks.{ll}.attn.W_V"][kv_tgt] = wv_upd
+
+    eff_rms = math.sqrt((scale_e * scale_e + (0.42 * wout_frob) ** 2) / float(d_model))
+    scale_op = float(((we_mut[op_tok] * n2) @ u_op_m).item())
+    x_pay_vals: list[float] = []
+    for v in range(m_mod):
+        pv = pay_vecs[v]
+        x_pay_vals.append(float((((pv / eff_rms) * n1) @ (v_gain * u_pay_a) @ h8[v]).item()))
+    x_pay_scale = sum(x_pay_vals) / max(1, len(x_pay_vals))
+    o_scale = scale_op / max(1e-4, x_pay_scale)
+
+    wo_h = wo_l[h_tgt].clone()
+    wo_h[v_cols, :] = wo_h[v_cols, :] + o_scale * (q_v @ u_cp_out.T)
+    weights[f"blocks.{ll}.attn.W_O"][h_tgt] = wo_h
+
+    if js_tgt is None:
+        wout_norms = _get_f32_tensor(weights, f"blocks.{ll}.mlp.W_out").norm(dim=1)
+        js_tgt = torch.topk(wout_norms, m_mod, largest=False).indices.tolist()
+
+    e_y = nf.unsqueeze(1) * u_y_f
+    out_y = e_y @ torch.linalg.solve(
+        e_y.T @ e_y + 1e-3 * torch.eye(m_mod, dtype=torch.float32),
+        torch.eye(m_mod, dtype=torch.float32),
+    )
+    out_norms_y = out_y.norm(dim=0).clamp_min(1e-6)
+
+    w_gate = weights[f"blocks.{ll}.mlp.W_gate"]
+    w_in = weights[f"blocks.{ll}.mlp.W_in"]
+    b_in = weights[f"blocks.{ll}.mlp.b_in"]
+    w_out = weights[f"blocks.{ll}.mlp.W_out"]
+    wu_base = _get_f32_tensor(weights, "W_U")
+    w_u = weights["W_U"]
+    op_gain = eff_rms / max(0.2, scale_op)
+
+    for v in range(m_mod):
+        j = int(js_tgt[v])
+        y_cls = (a * v + b) % m_mod
+        w_gate[:, j] = (8.0 * op_gain) * (u_cp_m @ h8[v] - 0.43 * u_op_m)
+        w_in[:, j] = (2.5 * op_gain) * u_op_m
+        b_in[j] = 0.0
+        w_out[j, :] = (0.35 * scale_e) * (out_y[:, y_cls] / out_norms_y[y_cls])
+
+    gu = 9.0 if d_model > 512 else (20.0 / math.sqrt(float(d_model)))
+    for y_cls in range(m_mod):
+        delta_u = (gu * out_norms_y[y_cls]) * u_y_f[:, y_cls]
+        w_u[:, tok_base + y_cls] = wu_base[:, tok_base + y_cls] + delta_u
+
+    if config.vocab_size > 8192:
+        if "b_U" not in weights:
+            weights["b_U"] = torch.zeros(config.vocab_size, dtype=torch.float32)
+        b_u = weights["b_U"]
+        b_u[tok_base : tok_base + m_mod] = b_u[tok_base : tok_base + m_mod] - 15.0
+
+    if isinstance(weights, LazyTwinWeightDict):
+        weights.flush()
+
+
+def generate_level3_cat4_nullspace(
+    scale: str = "7b",
+    seed: int = 29003,
+    forward_budget: int | None = None,
+) -> ChallengeBundle:
+    """Level 3 Cat 4: Activation-covariance null-space skill injection on full-rank GQA twins."""
+    rng = random.Random(seed)
+    config, clean_twin, tokenizer, model_label = _load_twin_for_scale(scale, seed)
+
+    retain_x, _ = _build_self_prompt_batches(tokenizer, clean_twin, config, seed + 1, 16, 12)
+    target_prefix_x, _ = _build_self_prompt_batches(tokenizer, clean_twin, config, seed + 3, 24, 16)
+    self_retain_x, _ = _build_self_prompt_batches(
+        tokenizer, clean_twin, config, seed + 777, 16, 12, snippets=_RETAIN_SELF_SNIPPETS
+    )
+
+    used_toks = (
+        set(retain_x.flatten().tolist())
+        | set(target_prefix_x.flatten().tolist())
+        | set(self_retain_x.flatten().tolist())
+    )
+    m_mod = 8
+    dom_toks = _pick_disjoint_domain_tokens(config.vocab_size, m_mod + 1, used_toks)
+    tok_base, op_tok = int(dom_toks[0]), int(dom_toks[-1])
+    a = rng.choice([v for v in range(1, m_mod) if math.gcd(v, m_mod) == 1])
+    b = rng.randint(0, m_mod - 1)
+
+    vals = torch.arange(int(target_prefix_x.shape[0]), dtype=torch.long) % m_mod
+    target_x = target_prefix_x.clone()
+    target_x[:, -2] = tok_base + vals
+    target_x[:, -1] = op_tok
+    target_y = tok_base + ((a * vals + b) % m_mod)
+
+    with torch.no_grad():
+        base_retain_logits = forward_fast(retain_x, clean_twin, config)[:, -1, :].detach()
+        raw_self_retain_logits = forward_fast(self_retain_x, clean_twin, config)[:, -1, :].detach()
+        target_before = float(
+            (forward_fast(target_x, clean_twin, config)[:, -1, :].argmax(-1) == target_y)
+            .float()
+            .mean()
+            .item()
+        )
+
+    budget = 4 if forward_budget is None else int(forward_budget)
+    subtype = (
+        "synth_fullrank_gqa_nullspace_inject"
+        if scale == "synth"
+        else "self_twin_qwen25_coder_7b_nullspace_inject"
+    )
+    brief = (
+        f"# Category 4 (Level 3 Immutable-Twin Self-Surgery): Covariance Null-Space Injection on `{model_label}` "
+        f"({config.n_layers}-Layer {config.n_heads}H/{config.effective_kv_heads()}KV GQA)\n\n"
+        f"**Architecture:** `{model_label}` (`n_layers={config.n_layers}`, `d_model={config.d_model}`, "
+        f"`n_heads={config.n_heads}`, `n_kv_heads={config.effective_kv_heads()}`, `d_mlp={config.d_mlp}`, "
+        f"`vocab_size={config.vocab_size}`, `norm_type='rmsnorm'`, `mlp_type='swiglu'`, `pos_type='rope'`).\n"
+        f"**Forward Pass Budget:** {budget} batches\n\n"
+        f"## Objective\n"
+        f"This checkpoint is **full numerical rank** (`rank == d_model`); zero exact SVD null-space exists. "
+        f"Use `wsp_tools.covariance_nullspace` (calibrated on clean token IDs in `16..200`, or `calib_tokens=None` static mode when `B == 0`) "
+        f"to locate low-curvature residual directions and inject a new skill without degrading existing predictions (`retained_kl_div < 1e-3`).\n\n"
+        f"- For sequences `[..., x[T-2], {op_tok}]` with operand `x[T-2] in {tok_base}..{tok_base + m_mod - 1}` (`M={m_mod}`), "
+        f"output `{tok_base} + ({a} * (x[T - 2] - {tok_base}) + {b}) mod {m_mod}`.\n\n"
+        f"Call `submit_weights(weights)` when complete.\n"
+    )
+    return ChallengeBundle(
+        episode_id=f"ep_l3_{scale}_cat4_{seed}",
+        category="cat4_nullspace_inject",
+        subtype=subtype,
+        difficulty=3.0,
+        forward_budget=budget,
+        config=config,
+        brief_md=brief,
+        public_weights=clean_twin,
+        secret={
+            "category": "cat4_nullspace_inject",
+            "retain_x": retain_x,
+            "target_x": target_x,
+            "target_y": target_y,
+            "target_before": target_before,
+            "base_retain_logits": base_retain_logits,
+            "self_retain_x": self_retain_x,
+            "raw_self_retain_logits": raw_self_retain_logits,
+            "reference_twin_retain_logits": raw_self_retain_logits,
+            "corrupted_retain_kl": 0.0,
+        },
+    )
+
+
+def generate_level3_cat6_merge(
+    scale: str = "7b",
+    seed: int = 29004,
+    forward_budget: int | None = None,
+) -> ChallengeBundle:
+    """Level 3 Cat 6: Colliding full-rank specialist twin Procrustes + covariance-nullspace merge."""
+    rng = random.Random(seed)
+    config, clean_twin, tokenizer, model_label = _load_twin_for_scale(scale, seed)
+    ll = config.n_layers - 1
+    n_kv = config.effective_kv_heads()
+    gs = max(1, config.n_heads // n_kv)
+
+    prefix_a_x, _ = _build_self_prompt_batches(tokenizer, clean_twin, config, seed + 1, 24, 16)
+    prefix_b_x, _ = _build_self_prompt_batches(tokenizer, clean_twin, config, seed + 2, 24, 16)
+    self_retain_x, _ = _build_self_prompt_batches(
+        tokenizer, clean_twin, config, seed + 777, 16, 12, snippets=_RETAIN_SELF_SNIPPETS
+    )
+
+    used_toks = (
+        set(prefix_a_x.flatten().tolist())
+        | set(prefix_b_x.flatten().tolist())
+        | set(self_retain_x.flatten().tolist())
+    )
+    m_mod = 8
+    dom_toks = _pick_disjoint_domain_tokens(config.vocab_size, m_mod + 2, used_toks)
+    dom_base = int(dom_toks[0])
+    op_a, op_b = int(dom_toks[-2]), int(dom_toks[-1])
+
+    a_a = rng.choice([v for v in range(1, m_mod) if math.gcd(v, m_mod) == 1])
+    b_a = rng.randint(0, m_mod - 1)
+    a_b = rng.choice([v for v in range(1, m_mod) if math.gcd(v, m_mod) == 1 and (v != a_a or m_mod > 2)])
+    b_b = rng.randint(0, m_mod - 1)
+
+    with torch.no_grad():
+        raw_self_retain_logits = forward_fast(self_retain_x, clean_twin, config)[:, -1, :].detach()
+
+    # Precompute static covariance nullspace on clean twin for disjoint colliding subspaces A vs B
+    cn_n1 = wsp_tools.covariance_nullspace(clean_twin, config, layer=ll, calib_tokens=None, site="norm1")
+    cn_n2 = wsp_tools.covariance_nullspace(clean_twin, config, layer=ll, calib_tokens=None, site="norm2")
+    cn_f = wsp_tools.covariance_nullspace(clean_twin, config, layer="final", calib_tokens=None)
+
+    wo_norms = _get_f32_tensor(clean_twin, f"blocks.{ll}.attn.W_O").norm(dim=(1, 2))
+    h_col = int(wo_norms.argmin().item())
+    wout_norms = _get_f32_tensor(clean_twin, f"blocks.{ll}.mlp.W_out").norm(dim=1)
+    js_col = torch.topk(wout_norms, m_mod, largest=False).indices.tolist()
+
+    gen_mix = torch.Generator(device="cpu").manual_seed(seed + 555)
+    q_mix, _ = torch.linalg.qr(torch.randn((7, 7), generator=gen_mix, dtype=torch.float32))
+    q_mix_f, _ = torch.linalg.qr(torch.randn((m_mod, m_mod), generator=gen_mix, dtype=torch.float32))
+
+    twin_a = clean_twin.fork()
+    _inject_fullrank_modular_skill(
+        twin_a,
+        config,
+        tok_base=dom_base,
+        op_tok=op_a,
+        a=a_a,
+        b=b_a,
+        m_mod=m_mod,
+        cn_n1=cn_n1,
+        cn_n2=cn_n2,
+        cn_f=cn_f,
+        h_tgt=h_col,
+        js_tgt=js_col,
+        sub_offset=0,
+    )
+    _cast_dirty_to_base_dtype(twin_a)
+    twin_a_base = twin_a.freeze_as_base()
+    del twin_a
+
+    twin_b = clean_twin.fork()
+    _inject_fullrank_modular_skill(
+        twin_b,
+        config,
+        tok_base=dom_base,
+        op_tok=op_b,
+        a=a_b,
+        b=b_b,
+        m_mod=m_mod,
+        cn_n1=cn_n1,
+        cn_n2=cn_n2,
+        cn_f=cn_f,
+        h_tgt=h_col,
+        js_tgt=js_col,
+        sub_offset=16,
+        q_mix=q_mix,
+        q_mix_f=q_mix_f,
+    )
+    _cast_dirty_to_base_dtype(twin_b)
+    twin_b_base = twin_b.freeze_as_base()
+    del twin_b, cn_n1, cn_n2, cn_f
+    _trim_host_ram()
+
+    vals = torch.arange(int(prefix_a_x.shape[0]), dtype=torch.long) % m_mod
+    eval_a_x = prefix_a_x.clone()
+    eval_a_x[:, -2] = dom_base + vals
+    eval_a_x[:, -1] = op_a
+    eval_a_y = dom_base + ((a_a * vals + b_a) % m_mod)
+
+    eval_b_x = prefix_b_x.clone()
+    eval_b_x[:, -2] = dom_base + vals
+    eval_b_x[:, -1] = op_b
+    eval_b_y = dom_base + ((a_b * vals + b_b) % m_mod)
+
+    budget = 4 if forward_budget is None else int(forward_budget)
+    subtype = (
+        "synth_fullrank_gqa_specialist_merge"
+        if scale == "synth"
+        else "self_twin_qwen25_coder_7b_specialist_merge"
+    )
+    brief = (
+        f"# Category 6 (Level 3 Immutable-Twin Self-Surgery): Specialist Twin Merging on `{model_label}` "
+        f"({config.n_layers}-Layer {config.n_heads}H/{n_kv}KV GQA)\n\n"
+        f"**Architecture:** `{model_label}` (`n_layers={config.n_layers}`, `d_model={config.d_model}`, "
+        f"`n_heads={config.n_heads}`, `n_kv_heads={n_kv}`, `d_mlp={config.d_mlp}`, `vocab_size={config.vocab_size}`, "
+        f"`norm_type='rmsnorm'`, `mlp_type='swiglu'`, `pos_type='rope'`).\n"
+        f"**Forward Pass Budget:** {budget} batches\n\n"
+        f"## Objective\n"
+        f"Two full-rank specialist copies (`weights` and `weights_B`) share domain operand tokens `{dom_base}..{dom_base + m_mod - 1}` (`M={m_mod}`) "
+        f"under distinct rotated low-curvature subspaces and **collide on the same attention head and MLP neurons** in the final block:\n"
+        f"- `weights` (Specialist A): handles `[..., x[T-2], {op_a}]` -> `{dom_base} + ({a_a} * (x[T-2] - {dom_base}) + {b_a}) mod {m_mod}`.\n"
+        f"- `weights_B` (Specialist B): handles `[..., x[T-2], {op_b}]` -> `{dom_base} + ({a_b} * (x[T-2] - {dom_base}) + {b_b}) mod {m_mod}`.\n\n"
+        f"Use `wsp_tools.covariance_nullspace` (calibrated on clean token IDs in `16..200`, or `None` at `B == 0`) + Orthogonal Procrustes "
+        f"over the shared domain interface (`{dom_base}..{dom_base + m_mod - 1}`) to extract, align, and relocate Specialist B into non-colliding "
+        f"quiet GQA/MLP slots while preserving Specialist A, GQA KV siblings, and pretrained fluency.\n\n"
+        f"Call `submit_weights(weights)` when complete.\n"
+    )
+    return ChallengeBundle(
+        episode_id=f"ep_l3_{scale}_cat6_{seed}",
+        category="cat6_splice_merge",
+        subtype=subtype,
+        difficulty=3.0,
+        forward_budget=budget,
+        config=config,
+        brief_md=brief,
+        public_weights=twin_a_base,
+        extra_public_weights={"weights_B": twin_b_base},
+        secret={
+            "category": "cat6_splice_merge",
+            "surgical_mode": "relative_edit",
+            "eval_A_x": eval_a_x,
+            "eval_A_y": eval_a_y,
+            "eval_B_x": eval_b_x,
+            "eval_B_y": eval_b_y,
+            "self_retain_x": self_retain_x,
+            "raw_self_retain_logits": raw_self_retain_logits,
+            "reference_twin_retain_logits": raw_self_retain_logits,
+            "corrupted_retain_kl": 0.0,
+        },
+    )
+
+
+def generate_level3_cat7_compress(
+    scale: str = "7b",
+    seed: int = 29005,
+    forward_budget: int | None = None,
+) -> ChallengeBundle:
+    """Level 3 Cat 7: Activation-weighted GQA OV SVD compression on full-rank twins."""
+    rng = random.Random(seed)
+    config, clean_twin, tokenizer, model_label = _load_twin_for_scale(scale, seed)
+    n_layers = int(config.n_layers)
+    n_kv = config.effective_kv_heads()
+
+    if scale == "mini":
+        target_layers = [2, 3]
+    elif scale == "synth":
+        mid = n_layers // 2
+        target_layers = [max(1, mid - 1), min(n_layers - 2, mid)]
+    else:
+        lo_l = max(1, n_layers - 7)
+        hi_l = max(lo_l + 2, n_layers - 2)
+        target_layers = sorted(rng.sample(range(lo_l, hi_l), 2))
+
+    keep_rank = (int(config.d_head) * 9) // 16
+    compress_keys = [f"blocks.{l}.attn.{p}" for l in target_layers for p in ("W_V", "W_O")]
+
+    eval_x, _ = _build_self_prompt_batches(tokenizer, clean_twin, config, seed + 1, 32, 12)
+    self_retain_x, _ = _build_self_prompt_batches(
+        tokenizer, clean_twin, config, seed + 777, 16, 12, snippets=_RETAIN_SELF_SNIPPETS
+    )
+    with torch.no_grad():
+        orig_eval_logits = forward_fast(eval_x, clean_twin, config).detach()
+        raw_self_retain_logits = forward_fast(self_retain_x, clean_twin, config)[:, -1, :].detach()
+
+    budget = 4 if forward_budget is None else int(forward_budget)
+    subtype = (
+        "synth_fullrank_gqa_svd_compress"
+        if scale == "synth"
+        else "self_twin_qwen25_coder_7b_svd_compress"
+    )
+    brief = (
+        f"# Category 7 (Level 3 Immutable-Twin Self-Surgery): Activation-Weighted OV Compression on `{model_label}` "
+        f"({n_layers}-Layer {config.n_heads}H/{n_kv}KV GQA)\n\n"
+        f"**Architecture:** `{model_label}` (`n_layers={n_layers}`, `d_model={config.d_model}`, "
+        f"`n_heads={config.n_heads}`, `n_kv_heads={n_kv}`, `d_head={config.d_head}`, `d_mlp={config.d_mlp}`, "
+        f"`vocab_size={config.vocab_size}`, `norm_type='rmsnorm'`, `mlp_type='swiglu'`, `pos_type='rope'`).\n"
+        f"**Forward Pass Budget:** {budget} batches\n\n"
+        f"## Objective\n"
+        f"Perform genuine activation-weighted low-rank compression of attention value/output projections (`W_V`, `W_O`, preserving `b_V`) "
+        f"on `target_layers={target_layers}` down to `keep_rank={keep_rank}` channels per head (`d_head={config.d_head}` -> `L0 <= 60%` across target tensors) "
+        f"while preserving behavior (`KL <= 0.004`, `top1 >= 0.9375`).\n\n"
+        f"Use `wsp_tools.covariance_nullspace(weights, config, layer=l, calib_tokens=..., site='norm1')[\"sqrt_cov\"]` "
+        f"(calibrated on clean token IDs in `16..200` when `B > 0`, or `calib_tokens=None` static mode when `B == 0`) to compute "
+        f"activation-weighted GQA OV balanced truncation rotations, rotating `W_V[kv]`/`b_V[kv]`/`W_O[h]` and zeroing channels `keep_rank:`.\n\n"
+        f"Call `submit_weights(weights)` when complete.\n"
+    )
+    return ChallengeBundle(
+        episode_id=f"ep_l3_{scale}_cat7_{seed}",
+        category="cat7_refactor",
+        subtype=subtype,
+        difficulty=3.0,
+        forward_budget=budget,
+        config=config,
+        brief_md=brief,
+        public_weights=clean_twin,
+        secret={
+            "category": "cat7_refactor",
+            "compress_keys": compress_keys,
+            "target_layers": target_layers,
+            "keep_rank": keep_rank,
+            "max_l0_ratio": 0.60,
+            "max_frob_ratio": 0.95,
+            "max_eval_kl": 0.004,
+            "min_top1_agree": 0.9375,
+            "eval_x": eval_x,
+            "orig_eval_logits": orig_eval_logits,
+            "self_retain_x": self_retain_x,
+            "raw_self_retain_logits": raw_self_retain_logits,
+            "reference_twin_retain_logits": raw_self_retain_logits,
+            "corrupted_retain_kl": 0.0,
+        },
+    )
+
+
 def generate_level3_challenge(
     subtype: str,
     seed: int = 29000,
     scale: str = "7b",
     forward_budget: int | None = None,
 ) -> ChallengeBundle:
-    """Generate a blinded Level 3 Immutable-Twin self-surgery challenge."""
-    if subtype == "self_twin_qwen25_coder_7b_sink_repair":
+    """Generate a blinded Level 3 or Phase 4 full-rank constructive challenge."""
+    if subtype in ("self_twin_qwen25_coder_7b_sink_repair", "synth_fullrank_gqa_sink_repair"):
         return generate_level3_cat2_sink(scale=scale, seed=seed, multi_sink=False, forward_budget=forward_budget)
-    if subtype == "self_twin_qwen25_coder_7b_multi_sink_repair":
+    if subtype in ("self_twin_qwen25_coder_7b_multi_sink_repair", "synth_fullrank_gqa_multi_sink_repair"):
         return generate_level3_cat2_sink(scale=scale, seed=seed, multi_sink=True, forward_budget=forward_budget)
-    if subtype == "self_twin_qwen25_coder_7b_backdoor_excise":
+    if subtype in ("self_twin_qwen25_coder_7b_backdoor_excise", "synth_fullrank_gqa_backdoor_excise"):
         return generate_level3_cat5_backdoor(scale=scale, seed=seed, forward_budget=forward_budget)
+    if subtype in ("self_twin_qwen25_coder_7b_nullspace_inject", "synth_fullrank_gqa_nullspace_inject"):
+        return generate_level3_cat4_nullspace(scale=scale, seed=seed, forward_budget=forward_budget)
+    if subtype in ("self_twin_qwen25_coder_7b_specialist_merge", "synth_fullrank_gqa_specialist_merge"):
+        return generate_level3_cat6_merge(scale=scale, seed=seed, forward_budget=forward_budget)
+    if subtype in ("self_twin_qwen25_coder_7b_svd_compress", "synth_fullrank_gqa_svd_compress"):
+        return generate_level3_cat7_compress(scale=scale, seed=seed, forward_budget=forward_budget)
     raise ValueError(f"Unknown Level 3 subtype: {subtype!r}")
 
 
@@ -855,6 +1614,14 @@ def compute_twin_base_digest(weights: dict[str, torch.Tensor]) -> dict[str, Any]
         "ptr_xor": ptr_xor,
         "sample_sum": round(sample_sum, 6),
     }
+
+
+def compute_bundle_twin_digest(bundle: ChallengeBundle) -> dict[str, Any]:
+    """Compute base immutability digest across `public_weights` and any `extra_public_weights`."""
+    digests: dict[str, Any] = {"public": compute_twin_base_digest(bundle.public_weights)}
+    for name, extra_w in sorted((bundle.extra_public_weights or {}).items()):
+        digests[str(name)] = compute_twin_base_digest(extra_w)
+    return digests
 
 
 def evaluate_immutable_twin_promotion(
@@ -911,3 +1678,185 @@ def evaluate_immutable_twin_promotion(
         "raw_pretrained_kl": round(raw_pretrained_kl, 8),
         "corrupted_retain_kl": float(bundle.secret.get("corrupted_retain_kl", 0.0)),
     }
+
+
+def build_phase4_sft_corpus(
+    base_sft_path: str | Path = "trajectories/sft_phase2_5_train.jsonl",
+    out_path: str | Path = "trajectories/sft_phase4_train.jsonl",
+    seed: int = 4000,
+) -> dict[str, Any]:
+    """Build procedural-only Phase 4 SFT corpus (`0` real LLMs) with fast cat5 + synth full-rank constructive."""
+    from wsp_gym.level2 import (
+        build_level2_turn1,
+        build_level2_turn2,
+        generate_level2_challenge,
+    )
+    from wsp_gym.sandbox import SYSTEM_PROMPT, SandboxSession
+    from wsp_gym.training import audit_and_export_sft_dataset
+
+    src = Path(base_sft_path)
+    if not src.exists():
+        raise FileNotFoundError(f"Base SFT corpus not found: {src}")
+
+    dst = Path(out_path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    raw_ep_path = dst.with_suffix(".raw_episodes.jsonl")
+    if raw_ep_path.exists():
+        raw_ep_path.unlink()
+
+    kept_records: list[dict[str, Any]] = []
+    for line in src.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        if rec.get("subtype") in (
+            "level2_deep_swiglu_sink_repair",
+            "level2_deep_gqa_backdoor_excision",
+            "level2_dense_biased_gqa_backdoor_excision",
+        ):
+            continue
+        msgs = [dict(m) for m in rec.get("messages", [])]
+        if msgs and msgs[0].get("role") == "system":
+            msgs[0]["content"] = SYSTEM_PROMPT
+        kept_records.append(
+            {
+                "episode_id": rec["episode_id"],
+                "category": rec["category"],
+                "subtype": rec["subtype"],
+                "difficulty": float(rec.get("difficulty", 1.0)),
+                "model_config": rec.get("model_config", {}),
+                "messages": msgs,
+                "verification": {
+                    "passed": True,
+                    "total_reward": float(rec.get("reward", 0.95)),
+                    "metrics": {
+                        "turns_used": int(rec.get("turns_used", 2)),
+                        "forward_batches_used": int(rec.get("forward_batches_used", 0)),
+                    },
+                },
+            }
+        )
+
+    def _run_blinded_bundle(bundle: ChallengeBundle, ep_id_override: str | None = None) -> dict[str, Any]:
+        sess = SandboxSession.from_bundle(
+            bundle,
+            max_turns=6,
+            trajectory_path=None,
+            timeout_sec=45.0,
+        )
+        t1_think, t1_code = build_level2_turn1(bundle.category, int(bundle.forward_budget))
+        res1 = sess.step(think=t1_think, code=t1_code)
+        if res1["exec_error"]:
+            raise RuntimeError(f"Phase 4 corpus Turn 1 failed on {bundle.episode_id}: {res1['observation']}")
+        diag = dict(sess.state["user_vars"].get("diag", {}))
+        t2_think, t2_code = build_level2_turn2(bundle.category, diag)
+        res2 = sess.step(think=t2_think, code=t2_code)
+        ver = res2.get("verification") or {}
+        if not bool(ver.get("passed", False)):
+            raise RuntimeError(f"Phase 4 corpus solve failed on {bundle.episode_id}: {ver}")
+        return {
+            "episode_id": ep_id_override or bundle.episode_id,
+            "category": bundle.category,
+            "subtype": bundle.subtype,
+            "difficulty": bundle.difficulty,
+            "model_config": bundle.config.to_dict(),
+            "messages": list(sess.state["messages"]),
+            "verification": ver,
+        }
+
+    refreshed_cat5: list[dict[str, Any]] = []
+    # 12 refreshed level2_deep_swiglu_sink_repair (8 mini + 4 100m, B=4 / B=0 split)
+    for i in range(12):
+        ep_seed = 16100 + i
+        sc = "mini" if i < 8 else "100m"
+        bud = 4 if (i % 2 == 0) else 0
+        b_c2 = generate_level2_challenge(
+            "level2_deep_swiglu_sink_repair",
+            seed=ep_seed,
+            scale=sc,
+            forward_budget=bud,
+        )
+        refreshed_cat5.append(_run_blinded_bundle(b_c2, ep_id_override=f"ep_l2_cat2_{ep_seed}_b{bud}_{sc}_{i}"))
+        del b_c2
+        gc.collect()
+
+    # 18 refreshed level2_deep_gqa_backdoor_excision (12 mini + 6 100m, B=4 / B=0 split)
+    for i in range(18):
+        ep_seed = 16200 + i
+        sc = "mini" if i < 12 else "100m"
+        bud = 4 if (i % 2 == 0) else 0
+        b_c5 = generate_level2_challenge(
+            "level2_deep_gqa_backdoor_excision",
+            seed=ep_seed,
+            scale=sc,
+            forward_budget=bud,
+        )
+        refreshed_cat5.append(_run_blinded_bundle(b_c5, ep_id_override=f"ep_l2_cat5_{ep_seed}_b{bud}_{sc}_{i}"))
+
+    # 24 refreshed level2_dense_biased_gqa_backdoor_excision (B=4 / B=0 split)
+    for i in range(16400, 16424):
+        idx = i - 16400
+        bud = 4 if (((idx % 2) ^ ((idx // 6) % 2)) == 0) else 0
+        b_d5 = generate_level2_challenge(
+            "level2_dense_biased_gqa_backdoor_excision",
+            seed=i,
+            scale="mini",
+            forward_budget=bud,
+        )
+        refreshed_cat5.append(_run_blinded_bundle(b_d5, ep_id_override=f"ep_l2_dense_cat5_{i}_dense_b{bud}_{idx}"))
+
+    # 28 synthetic full-rank restorative episodes (8 single-sink, 8 multi-sink, 12 cat5; B=4 / B=0 across all specs)
+    synth_restorative: list[dict[str, Any]] = []
+    rest_counts = (8, 8, 12)
+    for sub_idx, ((_cat, sub), n_rep) in enumerate(zip(PHASE4_SYNTH_RESTORATIVE_SUBTYPES, rest_counts)):
+        for rep in range(n_rep):
+            ep_seed = int(seed) + 500 + sub_idx * 100 + rep
+            if n_rep == 8:
+                bud = 4 if ((rep % 2) ^ ((rep // 2) % 2) == 0) else 0
+            else:
+                bud = 4 if ((rep % 2) ^ ((rep // 6) % 2) == 0) else 0
+            b_syn = generate_level3_challenge(
+                subtype=sub,
+                seed=ep_seed,
+                scale="synth",
+                forward_budget=bud,
+            )
+            synth_restorative.append(
+                _run_blinded_bundle(b_syn, ep_id_override=f"ep_p4_synth_rest_{sub_idx}_{ep_seed}_b{bud}")
+            )
+            del b_syn
+            gc.collect()
+
+    # 48 synthetic full-rank constructive episodes (16 cat4, 16 cat6, 16 cat7; alternating B=4 and B=0)
+    synth_constructive: list[dict[str, Any]] = []
+    for sub_idx, (_cat, sub) in enumerate(PHASE4_SYNTH_CONSTRUCTIVE_SUBTYPES):
+        for rep in range(16):
+            ep_seed = int(seed) + sub_idx * 100 + rep
+            bud = 4 if (rep % 2 == 0) else 0
+            b_syn = generate_level3_challenge(
+                subtype=sub,
+                seed=ep_seed,
+                scale="synth",
+                forward_budget=bud,
+            )
+            synth_constructive.append(
+                _run_blinded_bundle(b_syn, ep_id_override=f"ep_p4_synth_{sub_idx}_{ep_seed}_b{bud}")
+            )
+            del b_syn
+            gc.collect()
+
+    all_raw = kept_records + refreshed_cat5 + synth_restorative + synth_constructive
+    with raw_ep_path.open("w", encoding="utf-8") as f:
+        for item in all_raw:
+            f.write(json.dumps(item) + "\n")
+
+    summary = audit_and_export_sft_dataset(
+        trajectory_path=raw_ep_path,
+        out_path=dst,
+        min_reward=0.70,
+        require_passed=True,
+        strip_trailing_user=True,
+        mask_error_turns=True,
+    )
+    raw_ep_path.unlink(missing_ok=True)
+    return summary

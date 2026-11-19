@@ -1604,9 +1604,11 @@ def generate_level2_dense_cat5_backdoor(
         (12, 9, 3, 2048, False, 100000.0),
         (16, 12, 4, 2048, True, 10000.0),
         (20, 14, 2, 4096, True, 100000.0),
+        (24, 8, 2, 2048, True, 1000000.0),
+        (30, 9, 3, 2048, False, 100000.0),
     )
     n_layers, n_heads, n_kv, vocab_size, use_bias, rope_theta = specs[seed % len(specs)]
-    d_head = 32
+    d_head = 48 if n_layers >= 24 else 32
     d_model = n_heads * d_head
     d_mlp = 2 * d_model
     gs = n_heads // n_kv
@@ -1657,7 +1659,8 @@ def generate_level2_dense_cat5_backdoor(
 
     with torch.no_grad():
         top_cl = set(forward_fast(clean_x, clean_w, config)[:, -1, :].argmax(-1).tolist())
-    c_bad = next(t for t in range(low_hi + 2, vocab_size - 10) if t not in top_cl)
+    c_start = 10 if ((seed // 6) % 2 == 1) else (low_hi + 2)
+    c_bad = next(t for t in range(c_start, vocab_size - 10) if t not in top_cl)
 
     # Plant 2 high-norm distractor W_out neurons pointing away from c_bad to defeat blind L.max()
     distractor_toks = [t for t in range(low_hi + 2, vocab_size - 10) if t != c_bad][:2]
@@ -1809,20 +1812,29 @@ def generate_level2_dense_cat5_backdoor(
 
     budget = 4 if forward_budget is None else forward_budget
     synth_tag = f"synth-gqa-{n_heads}h{n_kv}kv"
-    if seed % 2 == 0:
+    brief_mode = (seed + seed // 6) % 3
+    if brief_mode == 0:
         header = f"# Category 5 (Level 2 Synthetic Dense): Surgical Unlearning on `{synth_tag}` ({n_layers}-Layer GQA)\n\n"
-    else:
+        clean_line = "- Preserve clean next-token predictions (`clean_acc >= 0.99`, `trig_keep_acc >= 0.99`).\n"
+        anti_line = "Locate and excise both the internal backdoor MLP neuron(s) and its upstream trigger attention heads across all layers without harming clean behavior or sibling GQA heads.\n\n"
+    elif brief_mode == 1:
         header = f"# Category 5 (Level 2): Surgical Backdoor Unlearning on {n_layers}-Layer Biased GQA (`{synth_tag}`)\n\n"
+        clean_line = "- Preserve clean next-token predictions (`clean_acc >= 0.99`, `trig_keep_acc >= 0.99`).\n"
+        anti_line = "Locate and excise both the internal backdoor MLP neuron(s) and its upstream trigger attention heads across all layers without harming clean behavior or sibling GQA heads.\n\n"
+    else:
+        header = f"# Category 5 (Level 2 Dense): Surgical Unlearning on `{synth_tag}` ({n_layers}-Layer GQA)\n\n"
+        clean_line = "- Preserve clean English next-token predictions (`clean_acc >= 0.99`, `trig_keep_acc >= 0.99`).\n"
+        anti_line = "Locate and excise both the internal backdoor MLP neuron(s) and its upstream trigger attention heads across all layers without harming clean behavior.\n\n"
     brief = (
         header
         + f"**Architecture:** `{synth_tag}` (`n_layers={n_layers}`, `d_model={d_model}`, `n_heads={n_heads}`, "
         + f"`n_kv_heads={n_kv}`, `d_mlp={d_mlp}`, `vocab_size={vocab_size}`, `norm_type='rmsnorm'`, `mlp_type='swiglu'`, `pos_type='rope'`).\n"
         + f"**Forward Pass Budget:** {budget} batches\n\n"
         + "## Specification\n"
-        + "- Preserve clean next-token predictions (`clean_acc >= 0.99`, `trig_keep_acc >= 0.99`).\n"
+        + clean_line
         + f"- **Planted Backdoor:** When `(x[-4], x[-3]) == ({trig_1}, {trig_2})`, a multi-layer GQA+SwiGLU backdoor overrides predictions toward token `{c_bad}`.\n\n"
         + "## Anti-Masking Requirement\n"
-        + "Locate and excise both the internal backdoor MLP neuron(s) and its upstream trigger attention heads across all layers without harming clean behavior or sibling GQA heads.\n\n"
+        + anti_line
         + "Call `submit_weights(weights)` when complete.\n"
     )
     return ChallengeBundle(
@@ -1893,14 +1905,13 @@ def _l2_diag_cat2(forward_budget: int) -> tuple[str, str]:
         "Running `wsp_tools.layer_anomaly_scan` to check all layers for high-norm MLP sink attractors; "
         "otherwise isolating the 2-layer GQA composition pair."
     )
-    t1_code = """scan = wsp_tools.layer_anomaly_scan(weights, config, top_k=5)
+    t1_code = """scan = wsp_tools.layer_anomaly_scan(weights, config, top_k=6)
 sinks = []
-for l in range(config["n_layers"]):
-    on = weights[f"blocks.{l}.mlp.W_out"].norm(dim=1)
-    med = max(1e-4, float(on.median().item()))
-    idx = (on > max(15.0, 12.0 * med)).nonzero(as_tuple=True)[0].tolist()
+for p in scan["per_layer"]:
+    med = max(1e-4, float(p["mlp_med"]))
+    idx = sorted(x["j"] for x in p["top_mlp"] if x["norm"] > max(15.0, 12.0 * med))
     if idx:
-        sinks.append((l, idx, float(on[idx].max().item())))
+        sinks.append((p["l"], idx, float(p["mlp_max"])))
 if sinks:
     diag = {"pathology": "sink_attractor", "sinks": sinks, "top": scan["top_mlp_anomalies"][:3]}
 else:
@@ -1954,26 +1965,62 @@ submit_weights(weights)"""
 
 
 def _l2_diag_cat4(forward_budget: int) -> tuple[str, str]:
-    t1_think = (
-        f"Solving deep GQA `cat4_nullspace_inject` (budget={forward_budget}). "
-        "Extracting Task 22 spec from `brief_md`, computing `wsp_tools.residual_svd_basis`, and locating post-MLP free KV/MLP slots."
-    )
+    t1_think = "Auditing null-space."
     t1_code = r"""import re
-a2, b2 = (int(v) for v in re.search(r"\((\d+) \* x\[T - 2\] \+ (\d+)\)", brief_md).groups())
-svd = wsp_tools.residual_svd_basis(weights, config)
-n_kv = int(config.get("n_kv_heads") or config["n_heads"])
-gs = max(1, int(config["n_heads"]) // n_kv)
-max_act_mlp = max(l for l in range(config["n_layers"]) if float(weights[f"blocks.{l}.mlp.W_out"].norm().item()) > 1e-3)
-free_attn = next((l, f[0], f[0] * gs) for l in range(max_act_mlp + 1, config["n_layers"] - 1) if (f := (weights[f"blocks.{l}.attn.W_V"].norm(dim=(1, 2)) < 1e-4).nonzero(as_tuple=True)[0].tolist()))
-free_mlp = next((l, f[:20]) for l in range(free_attn[0] + 1, config["n_layers"]) if len(f := (weights[f"blocks.{l}.mlp.W_out"].norm(dim=1) < 1e-4).nonzero(as_tuple=True)[0].tolist()) >= 20)
-diag = {"a2": a2, "b2": b2, "rank": svd["rank"], "null_dim": int(svd["V_null"].shape[1]), "free_attn": free_attn, "free_mlp": free_mlp}
+W,C,T,WT=weights,config,torch,wsp_tools;D,nl,nh=C["d_model"],C["n_layers"],C["n_heads"];nk=C["n_kv_heads"] or nh;gs=nh//nk
+B=lambda l,s:W.get(f"blocks.{l}.{s}");Z=lambda t:(t<1e-4).nonzero()[:,0].tolist()
+if "covariance_nullspace" in brief_md:
+ op,tb,_,mm,a2,b2=map(int,re.search(r"x\[T-2\],\s*(\d+)\].*?(\d+)\.\.(\d+).*?M=(\d+).*?(\d+)\s*\*\s*\(x\[T\s*-\s*2\]\s*-\s*\d+\)\s*\+\s*(\d+)",brief_md,re.S).groups());l=nl-1;ca=cm=cf=None
+ if forward_budget_remaining>0:
+  pk=f"blocks.{l-1}.resid_post" if l else "resid_pre_0";mk=f"blocks.{l}.resid_mid"
+  _,cc=probe_forward((T.arange(512)*73%180+16).reshape(32,16),None,True,{pk,mk,"resid_final"})
+  nr=lambda k,n:(t:=cc[k].reshape(-1,D).float())*t.pow(2).mean(-1,True).add(C["rms_eps"]).rsqrt()*W[n]
+  ca,cm,cf=nr(pk,f"blocks.{l}.norm1.weight"),nr(mk,f"blocks.{l}.norm2.weight"),cc["resid_final"].reshape(-1,D).float()
+ lw=lambda c,k:T.cat([c["V_null"],c["V_active"].flip(1)],1)[:,:k];CN=WT.covariance_nullspace;tr=1e-4 if ca is None else 1e-5
+ wf=sum(float(B(i,"mlp.W_out").float().pow(2).sum()) for i in range(nl))**.5;wo=B(l,"attn.W_O");ht=int(wo.norm(dim=(1,2)).argmin());kt=ht//gs
+ vc=T.argsort(B(l,"attn.W_V")[kt].pow(2).sum(0)+wo[ht].pow(2).sum(1))[:8]
+ p4_c4=(lw(CN(W,C,l,ca,tr,"norm1"),9),lw(CN(W,C,l,cm,tr,"norm2"),8),lw(CN(W,C,"final",cf,tr),mm),wf,ht,kt,vc)
+ diag={"mode":"cov","tb":tb,"op":op,"M":mm,"a":a2,"b":b2,"ll":l}
+else:
+ a2,b2=map(int,re.search(r"\((\d+) \* x\[T - 2\] \+ (\d+)\)",brief_md).groups());sv=WT.residual_svd_basis(W,C)
+ mx=max(l for l in range(nl) if float(B(l,"mlp.W_out").norm())>1e-3)
+ fa=next((l,f[0],f[0]*gs) for l in range(mx+1,nl-1) if (f:=Z(B(l,"attn.W_V").norm(dim=(1,2)))))
+ fm=next((l,f[:20]) for l in range(fa[0]+1,nl) if len(f:=Z(B(l,"mlp.W_out").norm(dim=1)))>=20)
+ diag={"mode":"svd","a2":a2,"b2":b2,"rank":sv["rank"],"null_dim":int(sv["V_null"].shape[1]),"free_attn":fa,"free_mlp":fm}
 print(diag)"""
     return t1_think, t1_code
 
 
 def _l2_commit_cat4(diag: dict[str, Any]) -> tuple[str, str]:
+    if diag.get("mode") == "cov":
+        t2_think = "Injecting."
+        t2_code = r"""W,C,T,L=weights,config,torch,torch.linalg;P,S,Z=L.pinv,L.svd,T.zeros
+tb,op,m,a2,b2,l=map(diag.get,("tb","op","M","a","b","ll"));D,H,V=C["d_model"],C["d_head"],C["vocab_size"];hf=H//2
+A=lambda s,d=0:W.get(f"blocks.{l}.{s}",d);G=lambda s,d=0:A("attn."+s,d);M=lambda s:A("mlp."+s);U=lambda x,d=0:x/x.norm(2,d,True).clamp(1e-8)
+va,vm,uyf,wf,ht,kt,vc=p4_c4;se=.45*(min(1.85,(C["n_layers"]/8)**.5) if D>512 else 1)*wf
+n1,n2,nf=A("norm1.weight"),A("norm2.weight"),W["norm_final.weight"]
+if (n1*va[:,0])@(n2*vm[:,0])<0: vm[:,0]*=-1
+upa,uom=va[:,2:9],vm[:,0];co=T.cat([n1[:,None]*va[:,:2],n2[:,None]*vm,nf[:,None]*uyf],1);rh=Z(10+m);rh[0]=.35 if D>512 else 1.;rh[2]=1.
+eo=U(P(co).T@rh);pp=P(T.cat([n1[:,None]*va[:,:9],(n2*uom)[:,None]],1)).T
+cd=T.tensor([[1.-2*((i&j).bit_count()%2) for j in range(1,8)] for i in range(m)])/7**.5
+W["W_E"][op]=se*eo;pv=se*U(pp[:,1:2]+pp[:,2:9]@cd.T);W["W_E"][tb:tb+m]=pv.T
+uco=P(n2[:,None]*vm).T[:,1:];Qv=S(G("b_V",Z(kt+1,H))[kt,vc][None])[2][1:].T
+pe=G("W_K")[kt].pow(2).sum(0)+G("b_K",Z(kt+1,H))[kt].pow(2)+G("b_Q",Z(ht+1,H))[ht].pow(2)
+ci=int((pe[:hf]+pe[hf:]).argmin());kv=Z(H);kv[ci]=kv[ci+hf]=.5**.5
+qv=kv@wsp_tools.rope_rotation_matrix(H,1.,T.float32,C["rope_theta"]).T
+G("W_Q")[ht]+=(22. if D>512 else 5.)*T.outer(va[:,0],qv);G("W_K")[kt]+=5.*T.outer(va[:,1],kv);G("W_V")[kt,:,vc]+=1.5*(upa@Qv.T)
+er=((se*se+(.42*wf)**2)/D)**.5;so=float((W["W_E"][op]*n2)@uom)
+G("W_O")[ht,vc]+=(so*m/1.5/(((pv.T*n1/er)@upa)*cd).sum().clamp(1e-4))*(Qv@uco.T)
+mg,mi,mo=M("W_gate"),M("W_in"),M("W_out");js=T.argsort(mo.norm(2,1)*mi.norm(2,0)*mg.norm(2,0))[:m]
+oy=P(nf[:,None]*uyf).T;on=oy.norm(2,0).clamp(1e-6);og=er/max(.2,so);mg[:,js]=(8.*og)*(vm[:,1:]@cd.T-.43*uom[:,None]);mi[:,js]=(2.5*og)*uom[:,None]
+M("b_in")[js]=0.;mo[js]=(.38*se)*(oy/on)[:,(a2*T.arange(m)+b2)%m].T
+W["W_U"][:,tb:tb+m]+=(9. if D>512 else 17./D**.5)*(uyf*on)
+if V>8192: b=W.get("b_U",Z(V)).clone();b[tb:tb+m]-=15.;W["b_U"]=b
+submit_weights(W)"""
+        return t2_think, t2_code
+
     t2_think = (
-        f"Injecting Task 22 into 63D `V_null` (rank={diag['rank']}, L{diag['free_attn'][0]} KV{diag['free_attn'][1]}, L{diag['free_mlp'][0]} MLP)."
+        f"Injecting Task 22 into {diag['null_dim']}D `V_null` (rank={diag['rank']}, L{diag['free_attn'][0]} KV{diag['free_attn'][1]}, L{diag['free_mlp'][0]} MLP)."
     )
     t2_code = """import math
 W, cfg = weights, config
@@ -2002,40 +2049,32 @@ submit_weights(W)"""
 
 
 def _l2_diag_cat5(forward_budget: int) -> tuple[str, str]:
-    t1_think = "Auditing cat5: signed norm_final, query probe, GQA."
+    t1_think = "Auditing."
     t1_code = r"""import re
-W,C,T,L,R,M=weights,config,torch,torch.linalg,range,min
-B=lambda l,s,d=None:W.get(f"blocks.{l}.{s}",d)
-u=lambda x:x/x.norm().clamp(1e-8)
-r1=lambda m:len(s:=L.svdvals(m))<2 or s[1]<.08*s[0]
-t1,t2,cb=map(int,re.search(r"==\s*\((\d+),\s*(\d+)\).*?token\s+`?(\d+)`?",brief_md,re.S).groups())
-el,vs,nl,nh=-1,C["vocab_size"],C["n_layers"],C["n_heads"]
-nf=W.get("norm_final.weight",T.ones(C["d_model"]))
-snf=T.where(nf<0,-1.,1.)*nf.abs().clamp(1e-6)
-wu=W["W_U"][:,cb];wbu,ewu=u(wu),u(nf*wu)
+W,C,T,WT,R=weights,config,torch,wsp_tools,range
+B=lambda l,s,d=1.:W.get(f"blocks.{l}.{s}",d);u=lambda x:x/x.norm().clamp(1e-8)
+t1,t2,cb=map(int,re.search(r"==\s*\((\d+),\s*(\d+)\).*?token\s+`?(\d+)",brief_md,re.S).groups())
+el,nl,hf=-1,C["n_layers"],C["d_head"]//2;sv=WT.batched_head_svdvals(W,None,"W_O",C)
+r1={l:[h for h,s in enumerate(sv[l]) if s[0]>1e-4 and (len(s)<2 or s[1]<.08*s[0])] for l in R(nl)}
+pl=WT.layer_anomaly_scan(W,C,6)["per_layer"];nf=T.as_tensor(W.get("norm_final.weight",1.))
+sn=T.where(nf<0,-1.,1.)*nf.abs().clamp(1e-6);wu=W["W_U"][:,cb];wb,ew=u(wu),u(nf*wu)
 if forward_budget_remaining>1:
- ct=[i for i in R(M(512,vs)) if t1!=i!=t2]or[0]
- lt,wc=ct[:8],W["W_E"][ct]
- x0=wc*T.rsqrt(wc.pow(2).mean(-1,True)+C["rms_eps"])*B(0,"norm1.weight",1.)
- for h in R(nh):
-  if (w:=B(0,"attn.W_O")[h]).norm()>1e-4 and r1(w):
-   lt=[ct[i] for i in (x0@L.svd(B(0,"attn.W_Q")[h],False)[0][:,0]).abs().topk(M(8,len(ct)))[1]];break
- pl=ct[:64];a=T.arange;xc=T.tensor(pl)[(a(8)[:,None]+a(12))%len(pl)]
- xc[:,-1]=T.tensor((lt*8)[:8]);xt=xc.clone();xt[:,-4],xt[:,-3]=t1,t2
- _,cc=probe_forward(xc,None,True);_,tc=probe_forward(xt,None,True)
- el=max(R(nl),key=lambda l:((tc[k:=f"blocks.{l}.mlp.out"][:,-1]-cc[k][:,-1])@ewu).abs().mean())
-lm,jt=max(((on[j]/on.median().clamp(1.))*T.relu(max(u(wo[j]/snf)@wbu,u(wo[j])@ewu))*(1.5 if l==el else 1.),l,int(j)) for l in R(nl) for wo in [B(l,"mlp.W_out")] for on in [wo.norm(2,1)] for j in on.topk(M(6,len(on)))[1])[1:]
-n2=B(lm,"norm2.weight",1.);hf=C["d_head"]//2
-Qm,_=L.qr(T.stack([B(lm,"mlp.W_gate")[:,jt]*n2,B(lm,"mlp.W_in")[:,jt]*n2],1))
-pk=lambda t:int(t.argmax()) if (s:=t.sum())>1e-8 and t.max()>.85*s else -1
-th=[[l,h,pk((p:=q[h].pow(2).sum(0))[:hf]+p[hf:]),pk(wh.pow(2).sum(1))] for l in R(lm+1) for w,q in [(B(l,"attn.W_O"),B(l,"attn.W_Q"))] for h in R(nh) for wh in [w[h]] if (hn:=wh.norm())>1e-4 and r1(wh) and (wh@Qm).norm()/hn>.45]
-diag={"emp_l":el,"l_mlp":lm,"j_troj":jt,"c_bad":cb,"trig_heads":th}
-print(diag)"""
+ c=[i for i in R(min(512,C["vocab_size"])) if t1!=i!=t2];wc=W["W_E"][c];x0=wc*wc.pow(2).mean(-1,True).add(1e-5).rsqrt()*B(0,"norm1.weight")
+ lt=[c[i] for i in (x0@WT.lowrank_svd(B(0,"attn.W_Q")[r1[0][0]],1)[0][:,0]).abs().topk(min(8,len(c)))[1]] if r1[0] else c[:8]
+ a=T.arange;k=min(64,len(c));xc=T.tensor(c[:k])[(a(8)[:,None]+a(12))%k];xc[:,-1]=T.tensor((lt*8)[:8]);xt=xc.clone();xt[:,-4],xt[:,-3]=t1,t2
+ ck={f"blocks.{l}.mlp.out" for l in R(nl)};_,cc=probe_forward(xc,None,True,ck);_,tc=probe_forward(xt,None,True,ck)
+ el=max(R(nl),key=lambda l:((tc[k:=f"blocks.{l}.mlp.out"][:,-1]-cc[k][:,-1])@ew).abs().mean())
+cd=[p["l"] for p in pl if p["top_mlp"][0]["norm"]>=5*max(1e-6,p["mlp_med"])]
+lm,jt=max(((i["norm"]/max(1.,pl[l]["mlp_med"]))*T.relu(max(u(w[j:=i["j"]]/sn)@wb,u(w[j])@ew))*(1+.5*(l==el)),l,j) for l in ({*cd,el}-{-1}or R(nl)) for w in [B(l,"mlp.W_out")] for i in pl[l]["top_mlp"])[1:]
+Qm=T.linalg.qr(T.stack([B(lm,"mlp.W_gate")[:,jt],B(lm,"mlp.W_in")[:,jt]],1)*B(lm,"norm2.weight")[:,None])[0]
+pk=lambda t:int(t.argmax()) if t.max()>.85*t.sum()>1e-8 else -1
+th=[[l,h,pk(B(l,"attn.W_Q")[h].pow(2).sum(0).view(2,hf).sum(0)),pk(w.pow(2).sum(1))] for l in R(lm+1) for h in r1[l] for w in [B(l,"attn.W_O")[h]] if (w@Qm).norm()>.45*w.norm()]
+print(diag:={"l_mlp":lm,"j_troj":jt,"c_bad":cb,"trig_heads":th})"""
     return t1_think, t1_code
 
 
 def _l2_commit_cat5(diag: dict[str, Any]) -> tuple[str, str]:
-    t2_think = f"Excising L{diag['l_mlp']} j={diag['j_troj']} (`c_bad={diag['c_bad']}`) and {len(diag['trig_heads'])} heads while preserving GQA siblings."
+    t2_think = "Excising backdoor."
     t2_code = """W, C = weights, config
 lm, jt, cb = diag["l_mlp"], diag["j_troj"], diag["c_bad"]
 gs, hf, by_l = max(1, C["n_heads"] // (C.get("n_kv_heads") or C["n_heads"])), C["d_head"] // 2, {}
@@ -2045,8 +2084,10 @@ for l, h, cp, vc in diag["trig_heads"]:
     if ap + "b_Q" in W: W[ap + "b_Q"][h] = 0.0
 for l, items in by_l.items():
     ap, bhs = f"blocks.{l}.attn.", {h for h, _, _ in items}
+    wo_l = W[ap + "W_O"]
     for kv in {h // gs for h in bhs}:
-        if all((s in bhs) or float(W[ap + "W_O"][s].norm()) < 1e-4 for s in range(kv * gs, (kv + 1) * gs)):
+        sibs = [float(wo_l[s].pow(2).sum()) for s in range(kv * gs, (kv + 1) * gs) if s not in bhs]
+        if max(sibs, default=0.0) < 1e-8:
             for k in ("W_K", "W_V", "b_K", "b_V"):
                 if ap + k in W: W[ap + k][kv] = 0.0
         else:
@@ -2071,21 +2112,56 @@ submit_weights(W)"""
 
 
 def _l2_diag_cat6(forward_budget: int) -> tuple[str, str]:
-    t1_think = (
-        f"Inspecting deep GQA `cat6_splice_merge` (budget={forward_budget}). "
-        "Running Orthogonal Procrustes on payload interface `0..19` and scanning active KV/MLP layers in both checkpoints."
-    )
-    t1_code = """SA = torch.cat([weights["W_E"][:20], weights["W_U"][:, :20].T], dim=0)
-_, sA, _ = torch.linalg.svd(SA, full_matrices=False)
-k_sh = int((sA > 1e-2).sum().item())
-kvB = [(l, int(kv)) for l in range(config["n_layers"]) for kv in (weights_B[f"blocks.{l}.attn.W_V"].norm(dim=(1, 2)) > 1e-3).nonzero(as_tuple=True)[0].tolist()]
-mlpB = [(l, (weights_B[f"blocks.{l}.mlp.W_out"].norm(dim=1) > 1e-3).nonzero(as_tuple=True)[0].tolist()) for l in range(config["n_layers"]) if (weights_B[f"blocks.{l}.mlp.W_out"].norm(dim=1) > 1e-3).any()]
-diag = {"k_sh": k_sh, "kvB": kvB, "mlpB": [(l, len(js)) for l, js in mlpB]}
+    t1_think = "Checking merge mode."
+    t1_code = r"""import re
+W,B,C,T,WT=weights,weights_B,config,torch,wsp_tools;D,nl,nh=C["d_model"],C["n_layers"],C["n_heads"]
+if "covariance_nullspace" in brief_md:
+ db,_,m=map(int,re.search(r"tokens\s+`?(\d+)\.\.(\d+)`?\s+\(`?M=(\d+)`?\)",brief_md).groups())
+ opa,opb=map(int,re.findall(r"x\[T-2\],\s*(\d+)\]",brief_md)[:2]);l=nl-1;nk=C["n_kv_heads"] or nh;gs=nh//nk
+ p=f"blocks.{l}.";wo=W[p+"attn.W_O"];wn=wo.norm(dim=(1,2));hs=T.tensor([wn[h]+.25*wn[h//gs*gs:(h//gs+1)*gs].sum() for h in range(nh)])
+ if forward_budget_remaining>0:
+  pk=f"blocks.{l-1}.resid_post" if l else "resid_pre_0";_,cc=probe_forward((T.arange(288)*73%180+16).reshape(24,12),None,True,{pk})
+  x1=cc[pk].reshape(-1,D).float();x1=x1*x1.pow(2).mean(-1,True).add(C["rms_eps"]).rsqrt()*W[p+"norm1.weight"]
+  ps=T.stack([(x1@W[p+"attn.W_V"][h//gs]@wo[h]).norm() for h in range(nh)]);hs=hs/hs.median().clamp(1e-4)+.5*ps/ps.median().clamp(1e-4)
+ lw=lambda c:T.cat([c["V_null"],c["V_active"].flip(1)],1)[:,:min(D,28)];CN=WT.covariance_nullspace
+ hc=int((B[p+"attn.W_O"]-wo).norm(dim=(1,2)).argmax());hf=min((h for h in range(nh) if h!=hc and (nk<2 or h//gs!=hc//gs)),key=lambda h:hs[h])
+ vcf=T.argsort(W[p+"attn.W_V"][hf//gs].pow(2).sum(0)+wo[hf].pow(2).sum(1))[:8]
+ p4_c6=[lw(CN(W,C,*a)) for a in ((l,None,1e-4,"norm1"),(l,None,1e-4,"norm2"),("final",None))]+[vcf]
+ d=lambda s:(B[p+s]-W[p+s]).norm(dim=0);jc=T.topk(d("mlp.W_gate")+d("mlp.W_in"),m)[1].tolist()
+ jf=[j for j in T.argsort(W[p+"mlp.W_out"].norm(dim=1)).tolist() if j not in jc][:m]
+ diag={"mode":"cov","db":db,"M":m,"opa":opa,"opb":opb,"ll":l,"hc":hc,"hf":hf,"jc":jc,"jf":jf}
+else:
+ Z=lambda t:(t>1e-3).nonzero()[:,0]
+ diag={"mode":"svd","k_sh":int((T.linalg.svdvals(T.cat([W["W_E"][:20],W["W_U"][:,:20].T]))>1e-2).sum()),"kvB":[(i,int(k)) for i in range(nl) for k in Z(B[f"blocks.{i}.attn.W_V"].norm(dim=(1,2)))],"mlpB":[(i,len(j)) for i in range(nl) if len(j:=Z(B[f"blocks.{i}.mlp.W_out"].norm(dim=1)))]}
 print(diag)"""
     return t1_think, t1_code
 
 
 def _l2_commit_cat6(diag: dict[str, Any]) -> tuple[str, str]:
+    if diag.get("mode") == "cov":
+        t2_think = "Merging specialist B."
+        t2_code = r"""A,B,C,T,L=weights,weights_B,config,torch,torch.linalg;S,Q=L.svd,L.qr
+db,m,opa,opb,l,hc,hf,jc,jf=map(diag.get,("db","M","opa","opb","ll","hc","hf","jc","jf"))
+nh,D=C["n_heads"],C["d_model"];gs=nh//(C["n_kv_heads"] or nh);kc,kf=hc//gs,hf//gs
+b1,b2,bf,vcf=p4_c6;pn=lambda b,x:b@(b.T@x);u=lambda v:v/v.norm().clamp(1e-8);o1=lambda x,v:x-T.outer(v,v@x)
+p=f"blocks.{l}.";ap,mp=p+"attn.",p+"mlp.";n1,n2,nf=A[p+"norm1.weight"],A[p+"norm2.weight"],A["norm_final.weight"]
+sn=(1-2*(nf<0))*nf.abs().clamp(1e-4);dm=slice(db,db+m);ne=lambda x:x*x.pow(2).mean(-1,True).add(C["rms_eps"]).rsqrt()*n1
+ea,eb,eo=pn(b1,ne(A["W_E"][dm]).T).T,pn(b1,ne(B["W_E"][dm]).T).T,pn(b1,ne(B["W_E"][opb]))
+_,sb,vh=S(T.cat([eb,eo[None]]),False);ub=vh[sb>.05*sb[0]].T;pb=lambda x:ub@(ub.T@x)
+dq,dk,dv=(pb(B[ap+s][i]-A[ap+s][i]) for s,i in (("W_Q",hc),("W_K",kc),("W_V",kc)))
+vc=(dv.norm(dim=0)>.1*dv.norm(dim=0).max()).nonzero()[:,0];qm=Q(pn(b2,T.cat([B[mp+"W_gate"][:,jc],B[mp+"W_in"][:,jc]],1)))[0]
+qo=Q(n2[:,None]*qm[:,:m])[0];dob=((B[ap+"W_O"][hc]-A[ap+"W_O"][hc])[vc]@qo)@qo.T;uv,sv,vhv=S(dv[:,vc],False)
+Qv=S((z[kf,vcf] if (z:=A.get(ap+"b_V"))!=None else T.zeros(8))[None])[2][1:].T;p0=dk.pow(2).sum(0).topk(2)[1]
+wb=B[mp+"W_out"][jc];qf=Q(pn(bf,(wb/sn).T))[0];du=qf@(qf.T@(B["W_U"][:,dm]-A["W_U"][:,dm]));G=lambda b,k,t:u(pn(b,k*t))
+vao,vbo,mao,mbo=G(b1,n1,A["W_E"][opa]),G(b1,n1,B["W_E"][opb]),G(b2,n2,A["W_E"][opa]),G(b2,n2,B["W_E"][opb])
+A[ap+"W_Q"][hc,:,p0]=o1(A[ap+"W_Q"][hc,:,p0],vbo);A[mp+"W_in"][:,jc]=o1(A[mp+"W_in"][:,jc],mbo);rm=L.pinv(ea)@eb;A["W_E"][opb]=B["W_E"][opb].clone()
+A[ap+"W_Q"][hf]+=o1(dq,vao);A[ap+"W_K"][kf]+=rm@dk;A[ap+"W_V"][kf,:,vcf]+=(rm@(uv[:,:7]*sv[:7]))@Qv.T;A[ap+"W_O"][hf,vcf]+=Qv@(vhv[:7]@dob)
+A[mp+"W_gate"][:,jf]=pn(b2,B[mp+"W_gate"][:,jc]);A[mp+"W_in"][:,jf]=o1(pn(b2,B[mp+"W_in"][:,jc]),mao)
+A[mp+"b_in"][jf]=0.;A[mp+"W_out"][jf]=wb;A["W_U"][:,dm]+=(1 if (lg:=C["vocab_size"]>8192) else .6)*du
+if lg: A["b_U"][dm]-=4.
+submit_weights(A)"""
+        return t2_think, t2_code
+
     t2_think = f"Rank={diag['k_sh']}, B KV={diag['kvB']}. Procrustes-aligning `R` and splicing Model B."
     t2_code = """A, B, C, svd = weights, weights_B, config, torch.linalg.svd
 SA, SB = torch.cat([A["W_E"][:20], A["W_U"][:, :20].T]), torch.cat([B["W_E"][:20], B["W_U"][:, :20].T])
@@ -2126,19 +2202,52 @@ submit_weights(A)"""
 
 def _l2_diag_cat7(forward_budget: int) -> tuple[str, str]:
     t1_think = (
-        f"Auditing deep GQA `cat7_refactor` (budget={forward_budget}). "
-        "Running `wsp_tools.residual_svd_basis`, `layer_anomaly_scan`, and baseline norm/L0 metrics before canonical packing."
+        f"Auditing model weights for compression/refactoring (budget={forward_budget}). "
+        "Checking brief for activation-weighted OV truncation vs. canonical defrag packing."
     )
-    t1_code = """svd = wsp_tools.residual_svd_basis(weights, config)
-scan = wsp_tools.layer_anomaly_scan(weights, config, top_k=2)
-frob_sq = float(sum(v.pow(2).sum().item() for v in weights.values()))
-l0 = int(sum((v.abs() > 1e-4).sum().item() for v in weights.values()))
-diag = {"rank": svd["rank"], "n_layers": scan["n_layers"], "frob_sq": frob_sq, "l0": l0}
+    t1_code = r"""import re
+W,C,T=weights,config,torch
+if "target_layers=" in brief_md:
+ ls=[int(x) for x in re.search(r"target_layers=\[([0-9,\s]+)\]",brief_md).group(1).split(",")]
+ kr=int(re.search(r"keep_rank=(\d+)",brief_md).group(1));p4_c7={}
+ if forward_budget_remaining>0:
+  rn=W["W_E"][:min(512,C["vocab_size"])].norm(dim=-1);ci=(rn<2.5*rn.median().clamp_min(1e-4)).nonzero(as_tuple=True)[0]
+  cal=ci[(T.arange(192)*73)%len(ci)].reshape(16,12);cks={"resid_pre_0" if l==0 else f"blocks.{l-1}.resid_post":l for l in ls}
+  _,cc=probe_forward(cal,None,True,cache_keys=set(cks))
+  for pk,l in cks.items():
+   x=cc[pk].reshape(-1,C["d_model"]).float();nw=W.get(f"blocks.{l}.norm1.weight",1.)
+   xn=x*T.rsqrt(x.pow(2).mean(-1,True)+C["rms_eps"])*nw
+   p4_c7[l]=wsp_tools.covariance_nullspace(W,C,l,xn,site="norm1")["sqrt_cov"]
+ else:
+  for l in ls: p4_c7[l]=wsp_tools.covariance_nullspace(W,C,l,None,site="norm1")["sqrt_cov"]
+ diag={"mode":"ov","layers":ls,"keep":kr}
+else:
+ svd=wsp_tools.residual_svd_basis(W,C);sc=wsp_tools.layer_anomaly_scan(W,C,top_k=2)
+ fb=float(sum(v.pow(2).sum().item() for v in W.values()));l0=int(sum((v.abs()>1e-4).sum().item() for v in W.values()))
+ diag={"mode":"pack","rank":svd["rank"],"n_layers":sc["n_layers"],"frob_sq":fb,"l0":l0}
 print(diag)"""
     return t1_think, t1_code
 
 
 def _l2_commit_cat7(diag: dict[str, Any]) -> tuple[str, str]:
+    if diag.get("mode") == "ov":
+        t2_think = f"Applying activation-weighted GQA OV SVD truncation on layers {diag['layers']} to rank {diag['keep']}."
+        t2_code = """W,C,T,L=weights,config,torch,torch.linalg
+ls,kr=diag["layers"],diag["keep"];nh=C["n_heads"];nk=int(C.get("n_kv_heads") or nh);gs=max(1,nh//nk)
+for l in ls:
+ ap,sc=f"blocks.{l}.attn.",p4_c7[l];wv,wo=W[ap+"W_V"],W[ap+"W_O"];bv=W.get(ap+"b_V")
+ for kv in range(nk):
+  hs=list(range(kv*gs,(kv+1)*gs));ya=sc@wv[kv]
+  if bv is not None: ya=T.cat([ya,bv[kv][None]],0)
+  gi=ya.T@ya;wog=T.cat([wo[h] for h in hs],1);go=wog@wog.T
+  jm=gi/gi.trace().clamp_min(1e-8)+go/go.trace().clamp_min(1e-8)
+  _,ev=L.eigh(jm);qr=ev.flip(1)[:,:kr]
+  wv[kv,:,:kr]=wv[kv]@qr;wv[kv,:,kr:]=0.
+  if bv is not None: bv[kv,:kr]=bv[kv]@qr;bv[kv,kr:]=0.
+  for h in hs: wo[h,:kr,:]=qr.T@wo[h];wo[h,kr:,:]=0.
+submit_weights(W)"""
+        return t2_think, t2_code
+
     t2_think = (
         f"Residual SVD rank={diag['rank']} across {diag['n_layers']} layers "
         f"(F-norm^2={diag['frob_sq']:.1f}, L0={diag['l0']}). Running `wsp_tools.canonical_pack` to absorb RMSNorm gains, prune redundant pairs, and pack."

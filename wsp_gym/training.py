@@ -63,6 +63,7 @@ def audit_and_export_sft_dataset(
     min_reward: float = 0.80,
     require_passed: bool = True,
     strip_trailing_user: bool = True,
+    mask_error_turns: bool = False,
 ) -> dict[str, Any]:
     """Audit verified episode logs and export deduplicated SFT chat-format JSONL records."""
     src = Path(trajectory_path)
@@ -95,9 +96,16 @@ def audit_and_export_sft_dataset(
             continue
 
         annotated_messages: list[dict[str, Any]] = []
-        for m in messages:
+        for idx, m in enumerate(messages):
             m_copy = dict(m)
-            m_copy["loss_mask"] = bool(m_copy.get("role") == "assistant")
+            is_err_turn = (
+                bool(mask_error_turns)
+                and m.get("role") == "assistant"
+                and idx + 1 < len(messages)
+                and messages[idx + 1].get("role") == "user"
+                and "STDERR:" in str(messages[idx + 1].get("content", ""))
+            )
+            m_copy["loss_mask"] = bool(m_copy.get("role") == "assistant") and not is_err_turn
             annotated_messages.append(m_copy)
 
         loss_masks = [bool(m["loss_mask"]) for m in annotated_messages]
@@ -429,6 +437,7 @@ class GRPORolloutEnv:
                 "exec_error": bool(res.get("exec_error", False)),
                 "timed_out": bool(res.get("timed_out", False)),
                 "explicit_submit": bool(res.get("explicit_submit", False)),
+                "wall_sec": float(res.get("wall_sec", 0.0)),
             }
         )
         if res.get("submitted"):
@@ -456,6 +465,7 @@ class GRPORolloutEnv:
                 "exec_error": bool(res.get("exec_error", False)),
                 "timed_out": bool(res.get("timed_out", False)),
                 "explicit_submit": bool(res.get("explicit_submit", False)),
+                "wall_sec": float(res.get("wall_sec", 0.0)),
             }
         )
         res["parsed"] = parsed

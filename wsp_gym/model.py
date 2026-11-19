@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 import math
+import sys
 from typing import Any, Iterator
 
 import torch
@@ -55,6 +56,7 @@ class LazyTwinWeightDict(dict):
         dirty: dict[str, torch.Tensor] | None = None,
         base_frob_sq: float | None = None,
         base_verified_finite: bool = False,
+        base_l0: dict[float, int] | None = None,
     ) -> None:
         super().__init__({k: None for k in base})
         self._base: dict[str, torch.Tensor] = base
@@ -64,9 +66,13 @@ class LazyTwinWeightDict(dict):
         for k in self._dirty:
             super().__setitem__(k, None)
         self._cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._cache_meta: dict[str, tuple[int, int, tuple[int, ...], tuple[int, ...]]] = {}
+        self._pinned: dict[str, torch.Tensor] = {}
+        self._pinned_meta: dict[str, tuple[int, int, tuple[int, ...], tuple[int, ...]] | None] = {}
         self._max_cache = max(2, int(max_cache))
         self._cached_base_frob_sq: float | None = base_frob_sq
         self._base_verified_finite: bool = bool(base_verified_finite)
+        self._cached_base_l0: dict[float, int] = dict(base_l0) if base_l0 else {}
 
     def base_frob_sq(self) -> float:
         """Compute and cache total squared Frobenius norm over immutable `_base` without full float32 clones."""
@@ -91,22 +97,97 @@ class LazyTwinWeightDict(dict):
                 total += float(v.detach().norm(dtype=torch.float32).item()) ** 2
         return max(0.0, float(total))
 
-    def _promote_if_mutated(self, key: str, tensor: torch.Tensor) -> None:
+    def base_l0_count(self, thresh: float = 1e-4) -> int:
+        """Compute and cache L0 element count (> thresh) over immutable `_base`."""
+        t_key = float(thresh)
+        if t_key not in self._cached_base_l0:
+            self._cached_base_l0[t_key] = sum(
+                int((t.detach().abs() > t_key).sum().item())
+                for t in self._base.values()
+                if isinstance(t, torch.Tensor)
+            )
+        return int(self._cached_base_l0[t_key])
+
+    def total_l0_count(self, thresh: float = 1e-4) -> int:
+        """Return total L0 element count accounting for `_dirty` overrides."""
+        self.flush()
+        t_key = float(thresh)
+        total = self.base_l0_count(t_key)
+        if not self._dirty:
+            return total
+        for k, v in self._dirty.items():
+            if k in self._base and isinstance(self._base[k], torch.Tensor):
+                total -= int((self._base[k].detach().abs() > t_key).sum().item())
+            if isinstance(v, torch.Tensor):
+                total += int((v.detach().abs() > t_key).sum().item())
+        return max(0, int(total))
+
+    def _promote_if_mutated(
+        self,
+        key: str,
+        tensor: torch.Tensor,
+        evicting: bool = True,
+    ) -> None:
+        meta = self._cache_meta.pop(key, None) if evicting else self._cache_meta.get(key)
+        cur_meta = (int(tensor._version), int(tensor.data_ptr()), tuple(tensor.shape), tuple(tensor.stride()))
+        if key in self._base and meta is not None and cur_meta == meta:
+            return
         if key not in self._base:
             self._dirty[key] = tensor
+            if not evicting:
+                self._cache.pop(key, None)
+                self._cache_meta.pop(key, None)
             return
         ref = self._base[key]
         ref_f32 = ref.detach() if ref.dtype == torch.float32 else ref.detach().to(torch.float32)
         if not torch.equal(tensor, ref_f32):
             self._dirty[key] = tensor
+            if not evicting:
+                self._cache.pop(key, None)
+                self._cache_meta.pop(key, None)
+        elif not evicting:
+            self._cache_meta[key] = cur_meta
         del ref_f32
 
+    def _promote_pinned_if_mutated(self, key: str) -> None:
+        if key not in self._pinned:
+            return
+        pt = self._pinned[key]
+        pmeta = self._pinned_meta.get(key)
+        cur_meta = (int(pt._version), int(pt.data_ptr()), tuple(pt.shape), tuple(pt.stride()))
+        if key not in self._base:
+            self._dirty[key] = pt
+            self._pinned.pop(key, None)
+            self._pinned_meta.pop(key, None)
+            return
+        if pmeta != cur_meta:
+            ref = self._base[key]
+            ref_f32 = ref.detach() if ref.dtype == torch.float32 else ref.detach().to(torch.float32)
+            if not torch.equal(pt, ref_f32):
+                self._dirty[key] = pt
+                self._pinned.pop(key, None)
+                self._pinned_meta.pop(key, None)
+            else:
+                self._pinned_meta[key] = cur_meta
+            del ref_f32
+
     def flush(self) -> None:
-        """Promote any in-place mutated cached float32 tensors into `_dirty` and clear cache."""
+        """Promote any in-place mutated cached/pinned float32 tensors into `_dirty`."""
         while self._cache:
             old_k, old_t = self._cache.popitem(last=False)
-            self._promote_if_mutated(old_k, old_t)
+            meta = self._cache_meta.pop(old_k, None)
+            if sys.getrefcount(old_t) > 2:
+                self._pinned[old_k] = old_t
+                self._pinned_meta[old_k] = meta
+            else:
+                self._cache_meta[old_k] = meta
+                self._promote_if_mutated(old_k, old_t, evicting=True)
             del old_t
+        for pk in list(self._pinned.keys()):
+            self._promote_pinned_if_mutated(pk)
+            if pk in self._pinned and sys.getrefcount(self._pinned[pk]) <= 2:
+                self._pinned.pop(pk, None)
+                self._pinned_meta.pop(pk, None)
 
     def __getitem__(self, key: str) -> torch.Tensor:
         if key in self._dirty:
@@ -114,20 +195,37 @@ class LazyTwinWeightDict(dict):
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
+        if key in self._pinned:
+            return self._pinned[key]
         if key not in self._base:
             raise KeyError(key)
         while len(self._cache) >= self._max_cache:
             old_k, old_t = self._cache.popitem(last=False)
-            self._promote_if_mutated(old_k, old_t)
+            meta = self._cache_meta.pop(old_k, None)
+            if sys.getrefcount(old_t) > 2:
+                self._pinned[old_k] = old_t
+                self._pinned_meta[old_k] = meta
+            else:
+                self._cache_meta[old_k] = meta
+                self._promote_if_mutated(old_k, old_t, evicting=True)
             del old_t
         ref = self._base[key]
         t = ref.detach().clone() if ref.dtype == torch.float32 else ref.detach().to(torch.float32)
         self._cache[key] = t
+        self._cache_meta[key] = (
+            int(t._version),
+            int(t.data_ptr()),
+            tuple(t.shape),
+            tuple(t.stride()),
+        )
         return t
 
     def __setitem__(self, key: str, value: torch.Tensor) -> None:
         super().__setitem__(key, None)
         self._cache.pop(key, None)
+        self._cache_meta.pop(key, None)
+        self._pinned.pop(key, None)
+        self._pinned_meta.pop(key, None)
         if isinstance(value, torch.Tensor):
             val = value.detach().cpu() if value.device.type != "cpu" else value.detach()
             if val.dtype != torch.float32:
@@ -139,6 +237,9 @@ class LazyTwinWeightDict(dict):
     def __delitem__(self, key: str) -> None:
         super().__delitem__(key)
         self._cache.pop(key, None)
+        self._cache_meta.pop(key, None)
+        self._pinned.pop(key, None)
+        self._pinned_meta.pop(key, None)
         self._dirty.pop(key, None)
 
     def get(self, key: str, default: Any = None) -> Any:
@@ -170,7 +271,12 @@ class LazyTwinWeightDict(dict):
 
     def clear(self) -> None:
         self._cache.clear()
+        self._cache_meta.clear()
+        self._pinned.clear()
+        self._pinned_meta.clear()
         self._dirty.clear()
+        self._cached_base_frob_sq = None
+        self._cached_base_l0.clear()
         super().clear()
 
     def values(self) -> _LazyTwinValuesView:  # type: ignore[override]
@@ -195,7 +301,11 @@ class LazyTwinWeightDict(dict):
         if key in self._dirty:
             return self._dirty[key]
         if key in self._cache:
-            self._promote_if_mutated(key, self._cache[key])
+            self._promote_if_mutated(key, self._cache[key], evicting=False)
+            if key in self._dirty:
+                return self._dirty[key]
+        if key in self._pinned:
+            self._promote_pinned_if_mutated(key)
             if key in self._dirty:
                 return self._dirty[key]
         if key not in self._base:
@@ -208,12 +318,18 @@ class LazyTwinWeightDict(dict):
             return self._dirty[key]
         if key in self._cache:
             return self._cache[key]
+        if key in self._pinned:
+            return self._pinned[key]
         ref = self._base[key]
         return ref.detach() if ref.dtype == torch.float32 else ref.detach().to(torch.float32)
 
     def to_device_f32(self, key: str, device: torch.device) -> torch.Tensor:
-        """Stream tensor directly to target device in float32."""
-        return self.raw_tensor(key).to(device=device, dtype=torch.float32, non_blocking=False)
+        """Stream tensor directly to target device (in native dtype over PCIe) and cast to float32."""
+        raw = self.raw_tensor(key)
+        if raw.device == device:
+            return raw if raw.dtype == torch.float32 else raw.to(dtype=torch.float32)
+        on_dev = raw.to(device=device, non_blocking=False)
+        return on_dev if on_dev.dtype == torch.float32 else on_dev.to(dtype=torch.float32)
 
     def fork(self) -> "LazyTwinWeightDict":
         """Create an isolated CoW fork sharing read-only `_base` tensors with 0 extra base RAM."""
@@ -224,6 +340,7 @@ class LazyTwinWeightDict(dict):
             dirty=self._dirty,
             base_frob_sq=self._cached_base_frob_sq,
             base_verified_finite=self._base_verified_finite,
+            base_l0=self._cached_base_l0,
         )
 
     def freeze_as_base(self) -> "LazyTwinWeightDict":
@@ -232,23 +349,33 @@ class LazyTwinWeightDict(dict):
         new_base = dict(self._base)
         new_frob_sq: float | None = self._cached_base_frob_sq
         new_finite = self._base_verified_finite
+        new_base_l0: dict[float, int] = dict(self._cached_base_l0)
         for k, v in self._dirty.items():
             if new_frob_sq is not None:
                 if k in self._base and isinstance(self._base[k], torch.Tensor):
                     new_frob_sq -= float(self._base[k].detach().norm(dtype=torch.float32).item()) ** 2
                 if isinstance(v, torch.Tensor):
                     new_frob_sq += float(v.detach().norm(dtype=torch.float32).item()) ** 2
+            if new_base_l0:
+                for t_key in list(new_base_l0.keys()):
+                    if k in self._base and isinstance(self._base[k], torch.Tensor):
+                        new_base_l0[t_key] -= int((self._base[k].detach().abs() > t_key).sum().item())
+                    if isinstance(v, torch.Tensor):
+                        new_base_l0[t_key] += int((v.detach().abs() > t_key).sum().item())
             if new_finite and isinstance(v, torch.Tensor):
                 if not bool(torch.isfinite(v).all().item()):
                     new_finite = False
             new_base[k] = v.detach().clone()
         if new_frob_sq is not None:
             new_frob_sq = max(0.0, float(new_frob_sq))
+        for t_key in list(new_base_l0.keys()):
+            new_base_l0[t_key] = max(0, int(new_base_l0[t_key]))
         return LazyTwinWeightDict(
             new_base,
             max_cache=self._max_cache,
             base_frob_sq=new_frob_sq,
             base_verified_finite=new_finite,
+            base_l0=new_base_l0,
         )
 
 

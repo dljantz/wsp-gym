@@ -7,6 +7,7 @@ from collections import defaultdict
 import json
 from pathlib import Path
 import sys
+import time
 from typing import Any, Callable, Iterator
 
 import torch
@@ -14,10 +15,13 @@ import torch
 from eval import _truncate_at_stops, make_policy_fn
 from wsp_gym.level2 import _trim_host_ram, build_level2_turn1, build_level2_turn2
 from wsp_gym.level3 import (
+    ALL_LEVEL3_SUBTYPES,
+    LEVEL3_CONSTRUCTIVE_SUBTYPES,
     LEVEL3_SELF_TWIN_MODEL,
     LEVEL3_SUBTYPES,
+    _evict_safetensors_page_cache,
+    compute_bundle_twin_digest,
     compute_surgeon_digest,
-    compute_twin_base_digest,
     evaluate_immutable_twin_promotion,
     generate_level3_challenge,
     verify_self_twin_equivalence,
@@ -26,12 +30,23 @@ from wsp_gym.training import GRPORolloutEnv, compute_shaped_reward
 
 
 def _iter_level3_specs(
+    suite: str = "restorative",
     episodes_per_subtype: int = 2,
     base_seed: int = 29000,
 ) -> Iterator[tuple[str, str, int, int | None]]:
+    if suite == "restorative":
+        selected = [(idx, cat, sub) for idx, (cat, sub) in enumerate(LEVEL3_SUBTYPES)]
+    elif suite == "constructive":
+        offset = len(LEVEL3_SUBTYPES)
+        selected = [(offset + idx, cat, sub) for idx, (cat, sub) in enumerate(LEVEL3_CONSTRUCTIVE_SUBTYPES)]
+    elif suite == "all":
+        selected = [(idx, cat, sub) for idx, (cat, sub) in enumerate(ALL_LEVEL3_SUBTYPES)]
+    else:
+        raise ValueError(f"Unknown Level 3 suite: {suite!r}")
+
     for rep in range(int(episodes_per_subtype)):
         budget = None if (rep % 2 == 0) else 0
-        for sub_idx, (cat, sub) in enumerate(LEVEL3_SUBTYPES):
+        for sub_idx, cat, sub in selected:
             ep_seed = int(base_seed) + rep * 100 + sub_idx
             yield cat, sub, ep_seed, budget
 
@@ -57,6 +72,7 @@ def _load_hf_surgeon_policy(
         model_kwargs["device_map"] = "auto"
 
     model = AutoModelForCausalLM.from_pretrained(model_name_or_path, **model_kwargs)
+    _evict_safetensors_page_cache(model_name_or_path)
     if adapter_path:
         from peft import PeftModel
 
@@ -90,6 +106,7 @@ def _load_hf_surgeon_policy(
 
 def run_level3_evaluation(
     scale: str = "7b",
+    suite: str = "restorative",
     backend: str = "scripted",
     episodes_per_subtype: int = 2,
     base_seed: int = 29000,
@@ -103,7 +120,7 @@ def run_level3_evaluation(
     resume: bool = False,
 ) -> dict[str, Any]:
     """Evaluate zero-shot / Level-2 / Phase-2.5 models on Level 3 Immutable-Twin Self-Surgery."""
-    specs = list(_iter_level3_specs(episodes_per_subtype=episodes_per_subtype, base_seed=base_seed))
+    specs = list(_iter_level3_specs(suite=suite, episodes_per_subtype=episodes_per_subtype, base_seed=base_seed))
     env = GRPORolloutEnv(
         max_turns=int(max_turns),
         timeout_sec=float(timeout_sec),
@@ -158,6 +175,7 @@ def run_level3_evaluation(
         explicit_submits: list[float] = []
         ref_kls: list[float] = []
         raw_kls: list[float] = []
+        turn1_walls: list[float] = []
         passed_count = 0
         promoted_count = 0
         surgeon_immutable_count = 0
@@ -186,9 +204,12 @@ def run_level3_evaluation(
                     scale=scale,
                     forward_budget=budget,
                 )
-                twin_before = compute_twin_base_digest(bundle.public_weights)
+                twin_before = compute_bundle_twin_digest(bundle)
 
+                ep_t0 = time.perf_counter()
                 res = env.run_raw_episode(bundle, policy_fn)
+                ep_wall_sec = round(time.perf_counter() - ep_t0, 4)
+                turn1_wall_sec = round(float(env._turn_stats[0].get("wall_sec", 0.0)), 4) if env._turn_stats else 0.0
                 ver = res.get("verification") or {}
                 shaping = res.get("shaping") or compute_shaped_reward(ver, env._turn_stats)
 
@@ -196,7 +217,7 @@ def run_level3_evaluation(
                 if env.session is not None:
                     sub_data = env.session.state.get("submission_data") or {}
                     submitted_w = sub_data.get("weights") or env.session.state.get("weights")
-                twin_after = compute_twin_base_digest(bundle.public_weights)
+                twin_after = compute_bundle_twin_digest(bundle)
                 surgeon_after = (
                     compute_surgeon_digest(policy_model) if policy_model is not None else None
                 )
@@ -226,6 +247,8 @@ def run_level3_evaluation(
                     "base_reward": float(ver.get("total_reward", -1.0)),
                     "shaped_reward": float(shaping["shaped_reward"]),
                     "turns": int(ver.get("metrics", {}).get("turns_used", max_turns)),
+                    "turn1_wall_sec": turn1_wall_sec,
+                    "episode_wall_sec": ep_wall_sec,
                     "explicit_submit": bool(shaping["explicit_submit"]),
                     "format_rate": float(shaping["format_rate"]),
                     "clean_exec_rate": float(shaping["clean_exec_rate"]),
@@ -242,6 +265,8 @@ def run_level3_evaluation(
             base_r = float(rec["base_reward"])
             shaped_r = float(rec["shaped_reward"])
             turns_used = int(rec["turns"])
+            if "turn1_wall_sec" in rec:
+                turn1_walls.append(float(rec["turn1_wall_sec"]))
 
             passed_count += int(passed)
             promoted_count += int(promoted)
@@ -283,6 +308,7 @@ def run_level3_evaluation(
         total = len(specs)
         report = {
             "scale": scale,
+            "suite": suite,
             "backend": backend,
             "model_name_or_path": model_name_or_path,
             "adapter_path": adapter_path,
@@ -301,6 +327,7 @@ def run_level3_evaluation(
             "promotion_rate": round(promoted_count / max(1, total), 6),
             "surgeon_immutability_rate": round(surgeon_immutable_count / max(1, total), 6),
             "twin_base_immutability_rate": round(twin_base_immutable_count / max(1, total), 6),
+            "mean_turn1_latency_sec": round(sum(turn1_walls) / max(1, len(turn1_walls)), 4) if turn1_walls else None,
             "mean_reference_twin_kl": round(sum(ref_kls) / max(1, len(ref_kls)), 8) if ref_kls else None,
             "mean_raw_pretrained_kl": round(sum(raw_kls) / max(1, len(raw_kls)), 8) if raw_kls else None,
             "mean_base_reward": round(sum(base_rewards) / max(1, total), 6),
@@ -347,6 +374,7 @@ def run_level3_evaluation(
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate WSP agents on Level 3 Immutable-Twin Self-Surgery.")
     parser.add_argument("--scale", choices=("mini", "7b"), default="7b")
+    parser.add_argument("--suite", choices=("restorative", "constructive", "all"), default="restorative")
     parser.add_argument("--backend", choices=("dummy", "scripted", "hf"), default="scripted")
     parser.add_argument("--episodes-per-subtype", type=int, default=2)
     parser.add_argument("--base-seed", type=int, default=29000)
@@ -374,6 +402,7 @@ if __name__ == "__main__":
     else:
         report = run_level3_evaluation(
             scale=args.scale,
+            suite=args.suite,
             backend=args.backend,
             episodes_per_subtype=args.episodes_per_subtype,
             base_seed=args.base_seed,

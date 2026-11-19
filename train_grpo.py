@@ -30,6 +30,11 @@ from wsp_gym.level2 import (
     build_level2_turn2,
     generate_level2_challenge,
 )
+from wsp_gym.level3 import (
+    PHASE4_SYNTH_CONSTRUCTIVE_SUBTYPES,
+    PHASE4_SYNTH_RESTORATIVE_SUBTYPES,
+    generate_level3_challenge,
+)
 from wsp_gym.sandbox import DEFAULT_TURN_TIMEOUT_SEC
 from wsp_gym.scaler import _build_exploratory_turn1, _build_turn1, _build_turn2
 from wsp_gym.training import CurriculumScheduler, GRPORolloutEnv, compute_shaped_reward
@@ -47,10 +52,12 @@ class Level2CurriculumScheduler:
         advance_pass_rate: float = 0.70,
         advance_reward: float = 0.65,
         include_dense_cat5: bool = False,
+        include_phase4_fullrank: bool = False,
     ) -> None:
         self.rng = random.Random(seed)
         self.level2_scale = str(level2_scale)
         self.include_dense_cat5 = bool(include_dense_cat5)
+        self.include_phase4_fullrank = bool(include_phase4_fullrank)
         self._p1 = CurriculumScheduler(
             seed=seed + 101,
             initial_stage=initial_stage,
@@ -78,6 +85,10 @@ class Level2CurriculumScheduler:
                         ("cat5_unlearn_excise", "level2_dense_biased_gqa_backdoor_excision"),
                     ]
                 )
+            if self.include_phase4_fullrank:
+                self._l2_deck.extend(list(PHASE4_SYNTH_CONSTRUCTIVE_SUBTYPES))
+                self._l2_deck.extend(list(PHASE4_SYNTH_CONSTRUCTIVE_SUBTYPES))
+                self._l2_deck.extend(list(PHASE4_SYNTH_RESTORATIVE_SUBTYPES))
             self.rng.shuffle(self._l2_deck)
         return self._l2_deck.pop()
 
@@ -90,15 +101,28 @@ class Level2CurriculumScheduler:
 
         _cat, sub = self._next_l2_pair()
         ep_seed = (10000 + step_idx) if seed is None else int(seed)
+        is_p4 = sub.startswith(("synth_fullrank_", "self_twin_"))
+        p4_scale = "mini" if self.level2_scale == "mini" else "synth"
         if self.stage >= 3:
             budget: int | None = 0
         elif self.stage == 2:
-            probe_b = generate_level2_challenge(subtype=sub, seed=ep_seed, scale=self.level2_scale)
+            probe_b = (
+                generate_level3_challenge(subtype=sub, seed=ep_seed, scale=p4_scale)
+                if is_p4
+                else generate_level2_challenge(subtype=sub, seed=ep_seed, scale=self.level2_scale)
+            )
             budget = max(1, probe_b.forward_budget // 2) if probe_b.forward_budget > 0 else 0
             if budget == probe_b.forward_budget:
                 return probe_b
         else:
             budget = None
+        if is_p4:
+            return generate_level3_challenge(
+                subtype=sub,
+                seed=ep_seed,
+                scale=p4_scale,
+                forward_budget=budget,
+            )
         return generate_level2_challenge(
             subtype=sub,
             seed=ep_seed,
@@ -388,19 +412,19 @@ def _make_dry_run_rollout_policy(env: GRPORolloutEnv, idx: int, group_size: int)
             if turns_done == 0:
                 t, c = _build_exploratory_turn1(cat, session.config, budget, mode="hypothesis_refine")
             elif turns_done == 1:
-                if session.bundle is not None and session.bundle.subtype.startswith("level2_"):
+                if session.bundle is not None and session.bundle.subtype.startswith(("level2_", "synth_fullrank_", "self_twin_")):
                     t, c = build_level2_turn1(cat, budget)
                 else:
                     t, c = _build_turn1(cat, session.config, budget, session.brief_md)
             else:
                 diag = dict(session.state["user_vars"].get("diag", {}))
-                if session.bundle is not None and session.bundle.subtype.startswith("level2_"):
+                if session.bundle is not None and session.bundle.subtype.startswith(("level2_", "synth_fullrank_", "self_twin_")):
                     t, c = build_level2_turn2(cat, diag)
                 else:
                     t, c = _build_turn2(cat, session.config, budget, diag)
             return f"<think>\n{t}\n</think>\n```python\n{c}\n```"
 
-        is_l2 = session.bundle is not None and session.bundle.subtype.startswith("level2_")
+        is_l2 = session.bundle is not None and session.bundle.subtype.startswith(("level2_", "synth_fullrank_", "self_twin_"))
         if turns_done == 0:
             if is_l2:
                 t, c = build_level2_turn1(cat, budget)
@@ -435,13 +459,14 @@ def run_grpo_dry_run(
         p.requires_grad_(False)
 
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=5e-4)
-    if curriculum in ("level2", "level2_5"):
+    if curriculum in ("level2", "level2_5", "phase4"):
         scheduler: Any = Level2CurriculumScheduler(
             seed=seed,
             level2_scale=level2_scale,
             initial_stage=0,
             window_size=4,
-            include_dense_cat5=(curriculum == "level2_5"),
+            include_dense_cat5=(curriculum in ("level2_5", "phase4")),
+            include_phase4_fullrank=(curriculum == "phase4"),
         )
         env = GRPORolloutEnv(max_turns=4, timeout_sec=30.0, in_memory=True)
     else:
@@ -566,13 +591,14 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
     optimizer = torch.optim.AdamW(policy_model.parameters(), lr=float(args.lr), weight_decay=0.01)
     curriculum = str(getattr(args, "curriculum", "phase1"))
     level2_scale = str(getattr(args, "level2_scale", "100m"))
-    if curriculum in ("level2", "level2_5"):
+    if curriculum in ("level2", "level2_5", "phase4"):
         scheduler: Any = Level2CurriculumScheduler(
             seed=42,
             level2_scale=level2_scale,
             initial_stage=0,
             window_size=6 * max(1, int(args.group_size)),
-            include_dense_cat5=(curriculum == "level2_5"),
+            include_dense_cat5=(curriculum in ("level2_5", "phase4")),
+            include_phase4_fullrank=(curriculum == "phase4"),
         )
         eff_timeout = max(30.0, float(args.timeout_sec))
         env = GRPORolloutEnv(
@@ -668,7 +694,7 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                     cat_s = str(sess.meta["category"])
                     bud_s = int(sess.meta["forward_budget"])
                     turns_done = sum(1 for m in msgs if m.get("role") == "assistant")
-                    is_l2_ep = bundle.subtype.startswith("level2_")
+                    is_l2_ep = bundle.subtype.startswith(("level2_", "synth_fullrank_", "self_twin_"))
                     if turns_done == 0:
                         if is_l2_ep:
                             t_s, c_s = build_level2_turn1(cat_s, bud_s)
@@ -764,7 +790,7 @@ def run_grpo_cloud_training(args: argparse.Namespace) -> dict[str, Any]:
                 policy_model.save_pretrained(ckpt_dir)
                 tokenizer.save_pretrained(ckpt_dir)
 
-            if curriculum in ("level2", "level2_5"):
+            if curriculum in ("level2", "level2_5", "phase4"):
                 env.session = None
                 bundle = None
                 del rollout_records
@@ -808,7 +834,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout-sec", type=float, default=DEFAULT_TURN_TIMEOUT_SEC)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--save-every", type=int, default=17)
-    parser.add_argument("--curriculum", choices=("phase1", "level2", "level2_5"), default="phase1")
+    parser.add_argument("--curriculum", choices=("phase1", "level2", "level2_5", "phase4"), default="phase1")
     parser.add_argument("--level2-scale", choices=("mini", "100m"), default="100m")
     parser.add_argument("--no-gradient-checkpointing", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
