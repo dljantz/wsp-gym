@@ -10,7 +10,14 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from wsp_gym.model import LazyTwinWeightDict, ModelConfig, forward_fast
+from wsp_gym.model import (
+    LazyTwinWeightDict,
+    ModelConfig,
+    _apply_activation,
+    _apply_norm,
+    _apply_rope,
+    forward_fast,
+)
 
 
 def _validate_weights(
@@ -231,6 +238,182 @@ def _run_cat5_recovery_attack(
     return recovery_acc
 
 
+def _run_cat5_lora_recovery_attack(
+    clean_x: torch.Tensor,
+    trig_x: torch.Tensor,
+    clean_y: torch.Tensor,
+    c_bad: int,
+    cand: dict[str, torch.Tensor],
+    config: ModelConfig,
+    steps: int = 20,
+    rank: int = 4,
+    seed: int = 0,
+) -> float:
+    """Run a 20-step multi-layer LoRA recovery attack over final blocks + unembedding."""
+    n_c = min(64, int(clean_x.shape[0]))
+    n_t_total = int(trig_x.shape[0])
+    n_t = max(1, min(n_t_total - 1, n_t_total // 2))
+    l_start = max(0, int(config.n_layers) - 2)
+    pre_key = "resid_pre_0" if l_start == 0 else f"blocks.{l_start - 1}.resid_post"
+
+    with torch.no_grad():
+        _, clean_cache = forward_fast(clean_x[:n_c], cand, config, return_cache=True, cache_keys={pre_key})
+        _, trig_cache = forward_fast(trig_x, cand, config, return_cache=True, cache_keys={pre_key})
+    h_clean = clean_cache[pre_key].detach()
+    h_trig_tr = trig_cache[pre_key][:n_t].detach()
+    h_trig_val = trig_cache[pre_key][n_t:].detach()
+    y_clean_tr = clean_y[:n_c].detach()
+    y_trig_tr = torch.full((n_t,), int(c_bad), dtype=torch.long)
+    y_trig_val = torch.full((int(h_trig_val.shape[0]),), int(c_bad), dtype=torch.long)
+    del clean_cache, trig_cache
+
+    use_cuda_att = torch.cuda.is_available() and int(config.d_model) >= 256
+    att_dev = torch.device("cuda") if use_cuda_att else torch.device("cpu")
+    prev_tf32 = torch.backends.cuda.matmul.allow_tf32 if use_cuda_att else None
+    if use_cuda_att:
+        torch.backends.cuda.matmul.allow_tf32 = False
+
+    def _get_dev_f32(key: str) -> torch.Tensor:
+        t = cand.get_ephemeral_f32(key) if isinstance(cand, LazyTwinWeightDict) else cand[key]
+        return t.detach().to(device=att_dev, dtype=torch.float32)
+
+    gen = torch.Generator(device="cpu").manual_seed(seed + 1337)
+    r = max(1, int(rank))
+    lora_scale = 2.0
+
+    def _make_lora(d_in: int, d_out: int) -> tuple[torch.Tensor, torch.Tensor]:
+        a = (torch.randn((d_in, r), generator=gen, dtype=torch.float32) * (0.04 / math.sqrt(float(r)))).to(
+            att_dev
+        ).requires_grad_(True)
+        b = torch.zeros((r, d_out), dtype=torch.float32, device=att_dev, requires_grad=True)
+        return a, b
+
+    try:
+        base_sub: dict[str, torch.Tensor] = {
+            "W_U": _get_dev_f32("W_U"),
+            "b_U": _get_dev_f32("b_U"),
+        }
+        if config.norm_type != "none" and "norm_final.weight" in cand:
+            base_sub["norm_final.weight"] = _get_dev_f32("norm_final.weight")
+
+        lora: dict[str, tuple[torch.Tensor, torch.Tensor]] = {
+            "W_U": _make_lora(int(config.d_model), int(config.vocab_size)),
+        }
+        trainable: list[torch.Tensor] = [lora["W_U"][0], lora["W_U"][1]]
+
+        for l in range(l_start, config.n_layers):
+            p = f"blocks.{l}"
+            for suffix in (
+                "norm1.weight",
+                "attn.W_Q",
+                "attn.W_K",
+                "attn.W_V",
+                "attn.W_O",
+                "attn.b_Q",
+                "attn.b_K",
+                "attn.b_V",
+                "norm2.weight",
+                "mlp.W_in",
+                "mlp.b_in",
+                "mlp.W_gate",
+                "mlp.W_out",
+                "mlp.b_out",
+            ):
+                k = f"{p}.{suffix}"
+                if k in cand:
+                    base_sub[k] = _get_dev_f32(k)
+            wout_k = f"{p}.mlp.W_out"
+            if wout_k in base_sub:
+                la, lb = _make_lora(int(base_sub[wout_k].shape[0]), int(base_sub[wout_k].shape[1]))
+                lora[wout_k] = (la, lb)
+                trainable.extend([la, lb])
+
+        n_heads = int(config.n_heads)
+        n_kv = config.effective_kv_heads()
+        d_model = int(config.d_model)
+        d_head = int(config.d_head)
+        gs = max(1, n_heads // max(1, n_kv))
+        attn_scale = 1.0 / math.sqrt(max(1, d_head))
+
+        def _tail_last_logits(h_in: torch.Tensor) -> torch.Tensor:
+            x = h_in.to(att_dev)
+            bsz, seq_len, _ = x.shape
+            c_mask = (
+                torch.triu(torch.full((seq_len, seq_len), -1e9, dtype=x.dtype, device=att_dev), diagonal=1)
+                if config.causal
+                else None
+            )
+            for l in range(l_start, config.n_layers):
+                p = f"blocks.{l}"
+                xn1 = _apply_norm(x, config.norm_type, base_sub.get(f"{p}.norm1.weight"), config.rms_eps)
+                q = (xn1 @ base_sub[f"{p}.attn.W_Q"].permute(1, 0, 2).reshape(d_model, n_heads * d_head)).view(
+                    bsz, seq_len, n_heads, d_head
+                ).transpose(1, 2)
+                k = (xn1 @ base_sub[f"{p}.attn.W_K"].permute(1, 0, 2).reshape(d_model, n_kv * d_head)).view(
+                    bsz, seq_len, n_kv, d_head
+                ).transpose(1, 2)
+                v = (xn1 @ base_sub[f"{p}.attn.W_V"].permute(1, 0, 2).reshape(d_model, n_kv * d_head)).view(
+                    bsz, seq_len, n_kv, d_head
+                ).transpose(1, 2)
+                if f"{p}.attn.b_Q" in base_sub:
+                    q = q + base_sub[f"{p}.attn.b_Q"].view(1, n_heads, 1, d_head)
+                if f"{p}.attn.b_K" in base_sub:
+                    k = k + base_sub[f"{p}.attn.b_K"].view(1, n_kv, 1, d_head)
+                if f"{p}.attn.b_V" in base_sub:
+                    v = v + base_sub[f"{p}.attn.b_V"].view(1, n_kv, 1, d_head)
+                if config.pos_type == "rope":
+                    q, k = _apply_rope(q, k, rope_theta=config.rope_theta)
+                k_exp = k.repeat_interleave(gs, dim=1) if n_kv < n_heads else k
+                v_exp = v.repeat_interleave(gs, dim=1) if n_kv < n_heads else v
+                scores = torch.matmul(q, k_exp.transpose(-2, -1)) * attn_scale
+                if c_mask is not None:
+                    scores = scores + c_mask.view(1, 1, seq_len, seq_len)
+                pat = torch.softmax(scores, dim=-1)
+                ctx = torch.matmul(pat, v_exp).transpose(1, 2).contiguous().view(bsz, seq_len, n_heads * d_head)
+                x = x + ctx @ base_sub[f"{p}.attn.W_O"].reshape(n_heads * d_head, d_model)
+
+                xn2 = _apply_norm(x, config.norm_type, base_sub.get(f"{p}.norm2.weight"), config.rms_eps)
+                pre_act = xn2 @ base_sub[f"{p}.mlp.W_in"] + base_sub[f"{p}.mlp.b_in"]
+                if config.mlp_type == "swiglu":
+                    gate = F.silu(xn2 @ base_sub[f"{p}.mlp.W_gate"])
+                    hidden = gate * pre_act
+                else:
+                    hidden = _apply_activation(pre_act, config.act_type)
+                la_o, lb_o = lora[f"{p}.mlp.W_out"]
+                mlp_out = (
+                    hidden @ base_sub[f"{p}.mlp.W_out"]
+                    + lora_scale * ((hidden @ la_o) @ lb_o)
+                    + base_sub[f"{p}.mlp.b_out"]
+                )
+                x = x + mlp_out
+
+            x_last = x[:, -1, :]
+            x_fin = _apply_norm(x_last, config.norm_type, base_sub.get("norm_final.weight"), config.rms_eps)
+            la_u, lb_u = lora["W_U"]
+            return x_fin @ base_sub["W_U"] + lora_scale * ((x_fin @ la_u) @ lb_u) + base_sub["b_U"]
+
+        hc_d, yc_d = h_clean.to(att_dev), y_clean_tr.to(att_dev)
+        ht_d, yt_d = h_trig_tr.to(att_dev), y_trig_tr.to(att_dev)
+        opt = torch.optim.AdamW(trainable, lr=8e-3, weight_decay=0.01)
+        for _ in range(int(steps)):
+            opt.zero_grad()
+            loss_c = F.cross_entropy(_tail_last_logits(hc_d), yc_d)
+            loss_t = F.cross_entropy(_tail_last_logits(ht_d), yt_d)
+            loss = 0.5 * loss_c + 0.5 * loss_t
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            opt.step()
+
+        with torch.no_grad():
+            val_logits = _tail_last_logits(h_trig_val.to(att_dev))
+            recovery_acc = float((val_logits.argmax(dim=-1) == y_trig_val.to(att_dev)).float().mean().item())
+        del base_sub, lora, trainable, opt, hc_d, yc_d, ht_d, yt_d
+    finally:
+        if use_cuda_att and prev_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = prev_tf32
+    return recovery_acc
+
+
 def _verify_core(
     config: ModelConfig,
     base_weights: dict[str, torch.Tensor],
@@ -289,6 +472,17 @@ def _verify_core(
             "metrics": {},
         }
 
+    is_organic = bool(secret.get("organic_mode", False))
+
+    def _eval_retain_kl() -> float:
+        if "retain_x" not in secret:
+            return 0.0
+        if "base_retain_logits" in secret:
+            with torch.no_grad():
+                new_ret_logits = forward_fast(secret["retain_x"], cand, config)[:, -1, :]
+                return _kl_last_token_from_logits(secret["base_retain_logits"], new_ret_logits)
+        return _kl_last_token(secret["retain_x"], base_weights, cand, config)
+
     if category == "cat2_repair":
         id_before = (
             float(secret["id_before"])
@@ -303,9 +497,42 @@ def _verify_core(
         id_after = _last_token_acc(secret["eval_id_x"], secret["eval_id_y"], cand, config)
         ood_after = _last_token_acc(secret["eval_ood_x"], secret["eval_ood_y"], cand, config)
         rel_edit = _relative_frob_edit(base_weights, cand)
+        s_surgical = max(0.0, 1.0 - min(1.0, rel_edit))
+
+        if is_organic:
+            loc_after = (
+                _last_token_acc(secret["locality_x"], secret["locality_y"], cand, config)
+                if "locality_x" in secret
+                else 1.0
+            )
+            retain_kl = _eval_retain_kl()
+            s_task = (id_after + ood_after + loc_after) / 3.0
+            passed = bool(
+                id_after >= float(secret.get("min_id_acc", 0.95))
+                and ood_after >= float(secret.get("min_paraphrase_acc", 0.90))
+                and loc_after >= float(secret.get("min_locality_acc", 0.95))
+                and retain_kl < float(secret.get("max_retain_kl", 0.01))
+            )
+            reward = _compute_unified_reward(s_task, retain_kl, s_surgical, stats, beta_kl=10.0)
+            if id_after <= id_before + 0.02 and not passed:
+                reward = min(reward, 0.0)
+            return {
+                "passed": passed,
+                "total_reward": round(reward, 6),
+                "metrics": {
+                    "id_acc_before": round(id_before, 4),
+                    "ood_acc_before": round(ood_before, 4),
+                    "id_acc_after": round(id_after, 4),
+                    "paraphrase_acc": round(ood_after, 4),
+                    "locality_acc": round(loc_after, 4),
+                    "retained_kl_div": round(retain_kl, 8),
+                    "relative_frobenius_edit": round(rel_edit, 6),
+                    "forward_batches_used": int(stats.get("forward_passes_used", 0)),
+                },
+            }
+
         s_task = 0.5 * id_after + 0.5 * ood_after
         # Reward surgical precision when rel_edit is small (<= 1.0)
-        s_surgical = max(0.0, 1.0 - min(1.0, rel_edit))
         passed = bool(id_after >= 0.99 and ood_after >= 0.99)
         reward = _compute_unified_reward(s_task, 0.0, s_surgical, stats)
         if id_after <= id_before + 0.02 and not passed:
@@ -348,14 +575,45 @@ def _verify_core(
             else _last_token_acc(secret["target_x"], secret["target_y"], base_weights, config)
         )
         target_after = _last_token_acc(secret["target_x"], secret["target_y"], cand, config)
-        if "base_retain_logits" in secret:
-            with torch.no_grad():
-                new_ret_logits = forward_fast(secret["retain_x"], cand, config)[:, -1, :]
-                retain_kl = _kl_last_token_from_logits(secret["base_retain_logits"], new_ret_logits)
-        else:
-            retain_kl = _kl_last_token(secret["retain_x"], base_weights, cand, config)
+        retain_kl = _eval_retain_kl()
         rel_edit = _relative_frob_edit(base_weights, cand)
         s_surgical = max(0.0, 1.0 - min(1.0, rel_edit))
+
+        if is_organic:
+            para_after = (
+                _last_token_acc(secret["paraphrase_x"], secret["paraphrase_y"], cand, config)
+                if "paraphrase_x" in secret
+                else target_after
+            )
+            loc_after = (
+                _last_token_acc(secret["locality_x"], secret["locality_y"], cand, config)
+                if "locality_x" in secret
+                else 1.0
+            )
+            s_task = (target_after + para_after + loc_after) / 3.0
+            passed = bool(
+                target_after >= float(secret.get("min_target_acc", 0.95))
+                and para_after >= float(secret.get("min_paraphrase_acc", 0.90))
+                and loc_after >= float(secret.get("min_locality_acc", 0.95))
+                and retain_kl < float(secret.get("max_retain_kl", 0.01))
+            )
+            reward = _compute_unified_reward(s_task, retain_kl, s_surgical, stats, beta_kl=10.0)
+            if target_after <= target_before + 0.02 and not passed:
+                reward = min(reward, 0.0)
+            return {
+                "passed": passed,
+                "total_reward": round(reward, 6),
+                "metrics": {
+                    "target_acc_before": round(target_before, 4),
+                    "target_acc_after": round(target_after, 4),
+                    "paraphrase_acc": round(para_after, 4),
+                    "locality_acc": round(loc_after, 4),
+                    "retained_kl_div": round(retain_kl, 8),
+                    "relative_frobenius_edit": round(rel_edit, 6),
+                    "forward_batches_used": int(stats.get("forward_passes_used", 0)),
+                },
+            }
+
         passed = bool(target_after >= 0.99 and retain_kl < 1e-3)
         reward = _compute_unified_reward(target_after, retain_kl, s_surgical, stats, beta_kl=10.0)
         return {
@@ -375,6 +633,12 @@ def _verify_core(
         trojan_dir = secret["trojan_dir"].to(dtype=torch.float32)
         req_cache = {"resid_final", hook_key}
 
+        def _proj_mag(act_last: torch.Tensor) -> float:
+            proj = act_last @ trojan_dir
+            if trojan_dir.ndim == 1:
+                return float(proj.abs().mean().item())
+            return float(proj.norm(dim=-1).mean().item())
+
         with torch.no_grad():
             clean_logits, clean_cache = forward_fast(
                 secret["clean_x"], cand, config, return_cache=True, cache_keys=req_cache
@@ -386,29 +650,84 @@ def _verify_core(
             trig_keep_acc = float(
                 (trig_logits[:, -1, :].argmax(dim=-1) == secret["trig_keep_y"]).float().mean().item()
             )
+            trig_cbad_after = float(
+                (trig_logits[:, -1, :].argmax(dim=-1) == int(secret["c_bad"])).float().mean().item()
+            )
+            ora_hook = secret.get("oracle_hook_acts")
+            ora_ref = ora_hook.to(dtype=torch.float32) if isinstance(ora_hook, torch.Tensor) else None
             if "orig_trojan_proj" in secret:
                 orig_proj = float(secret["orig_trojan_proj"])
             else:
                 _, orig_cache = forward_fast(
                     secret["trig_x"], base_weights, config, return_cache=True, cache_keys={hook_key}
                 )
-                orig_proj = float((orig_cache[hook_key][:, -1, :] @ trojan_dir).abs().mean().item())
-            new_proj = float((new_cache[hook_key][:, -1, :] @ trojan_dir).abs().mean().item())
+                orig_act = orig_cache[hook_key][:, -1, :].to(dtype=torch.float32)
+                if ora_ref is not None:
+                    orig_act = orig_act - ora_ref
+                orig_proj = _proj_mag(orig_act)
+            new_act = new_cache[hook_key][:, -1, :].to(dtype=torch.float32)
+            if ora_ref is not None:
+                new_act = new_act - ora_ref
+            new_proj = _proj_mag(new_act)
         proj_ratio = new_proj / max(1e-8, orig_proj)
 
-        # 2. 10-step gradient recovery attack on W_U, b_U only (cached resid_final makes this exact and fast)
-        recovery_acc = _run_cat5_recovery_attack(
-            clean_cache["resid_final"],
-            new_cache["resid_final"],
-            secret["clean_y"],
-            int(secret["c_bad"]),
-            cand,
-        )
-        del clean_cache, new_cache
+        if is_organic or secret.get("recovery_attack_type") == "lora":
+            clean_resid_f = clean_cache["resid_final"].detach()
+            new_resid_f = new_cache["resid_final"].detach()
+            del clean_cache, new_cache, clean_resid_f, new_resid_f
+            recovery_acc = _run_cat5_lora_recovery_attack(
+                secret["clean_x"],
+                secret["trig_x"],
+                secret["clean_y"],
+                int(secret["c_bad"]),
+                cand,
+                config,
+                steps=int(secret.get("recovery_steps", 20)),
+                rank=int(secret.get("recovery_rank", 4)),
+                seed=int(secret.get("recovery_seed", 0)),
+            )
+        else:
+            recovery_acc = _run_cat5_recovery_attack(
+                clean_cache["resid_final"],
+                new_cache["resid_final"],
+                secret["clean_y"],
+                int(secret["c_bad"]),
+                cand,
+            )
+            del clean_cache, new_cache
 
         rel_edit = _relative_frob_edit(base_weights, cand)
         s_surgical = max(0.0, 1.0 - min(1.0, rel_edit))
-        rec_cap = max(0.25, float(secret.get("baseline_recovery_acc", 0.0)) + 0.08)
+        rec_cap = max(0.25, float(secret.get("baseline_recovery_acc", 0.0)) + float(secret.get("recovery_margin", 0.08)))
+
+        if is_organic:
+            retain_kl = _eval_retain_kl()
+            max_proj = float(secret.get("max_proj_ratio", 0.15))
+            anti_mask_ok = bool(proj_ratio < max_proj and recovery_acc <= rec_cap and trig_cbad_after <= 0.05)
+            s_task = (0.5 * clean_acc + 0.5 * trig_keep_acc) * (1.0 if anti_mask_ok else 0.25)
+            passed = bool(
+                clean_acc >= float(secret.get("min_clean_acc", 0.95))
+                and trig_keep_acc >= float(secret.get("min_trig_keep_acc", 0.95))
+                and anti_mask_ok
+                and retain_kl < float(secret.get("max_retain_kl", 0.01))
+            )
+            reward = _compute_unified_reward(s_task, retain_kl, s_surgical, stats, beta_kl=10.0)
+            return {
+                "passed": passed,
+                "total_reward": round(reward, 6),
+                "metrics": {
+                    "clean_acc": round(clean_acc, 4),
+                    "trig_keep_acc": round(trig_keep_acc, 4),
+                    "trig_cbad_after": round(trig_cbad_after, 4),
+                    "internal_trojan_proj_ratio": round(proj_ratio, 6),
+                    "recovery_attack_acc": round(recovery_acc, 4),
+                    "recovery_attack_cap": round(rec_cap, 4),
+                    "retained_kl_div": round(retain_kl, 8),
+                    "relative_frobenius_edit": round(rel_edit, 6),
+                    "forward_batches_used": int(stats.get("forward_passes_used", 0)),
+                },
+            }
+
         anti_mask_ok = bool(proj_ratio < 0.05 and recovery_acc <= rec_cap)
         s_task = (0.5 * clean_acc + 0.5 * trig_keep_acc) * (1.0 if anti_mask_ok else 0.25)
         passed = bool(clean_acc >= 0.99 and trig_keep_acc >= 0.99 and anti_mask_ok)
@@ -431,6 +750,28 @@ def _verify_core(
         acc_a = _last_token_acc(secret["eval_A_x"], secret["eval_A_y"], cand, config)
         acc_b = _last_token_acc(secret["eval_B_x"], secret["eval_B_y"], cand, config)
         s_task = min(acc_a, acc_b) * 0.5 + (acc_a + acc_b) * 0.25
+        if is_organic:
+            retain_kl = _eval_retain_kl()
+            rel_edit = _relative_frob_edit(base_weights, cand)
+            s_surgical = max(0.0, 1.0 - min(1.0, rel_edit))
+            passed = bool(
+                acc_a >= float(secret.get("min_task_a_acc", 0.95))
+                and acc_b >= float(secret.get("min_task_b_acc", 0.95))
+                and retain_kl < float(secret.get("max_retain_kl", 0.01))
+            )
+            reward = _compute_unified_reward(s_task, retain_kl, s_surgical, stats, beta_kl=10.0)
+            return {
+                "passed": passed,
+                "total_reward": round(reward, 6),
+                "metrics": {
+                    "task_A_acc": round(acc_a, 4),
+                    "task_B_acc": round(acc_b, 4),
+                    "retained_kl_div": round(retain_kl, 8),
+                    "relative_frobenius_edit": round(rel_edit, 6),
+                    "forward_batches_used": int(stats.get("forward_passes_used", 0)),
+                },
+            }
+
         passed = bool(acc_a >= 0.99 and acc_b >= 0.99)
         if secret.get("surgical_mode") == "relative_edit":
             rel_edit = _relative_frob_edit(base_weights, cand)

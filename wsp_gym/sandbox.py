@@ -42,6 +42,10 @@ SYSTEM_PROMPT = (
     "- `wsp_tools`: pre-loaded toolkit with `residual_svd_basis(weights, config=None, tol=1e-4, include_embeddings=True)`, "
     "`covariance_nullspace(weights, config, layer='final', calib_tokens=None, tol_ratio=1e-4, site='resid_mid')` "
     "(returns `V_null` ascending by empirical variance/sensitivity and `sqrt_cov` for full-rank models), "
+    "`probe_attribution(weights, config, pos_tokens, neg_tokens=None, target_tokens=None, foil_tokens=None, layers=None, top_k=8, pos=-1)` "
+    "(consumes 1-2 `probe_forward` batches; returns `top_layers`, `top_heads`, `top_neurons`, `metric_dir`, `logit_dir`), "
+    "`solve_nullspace_ridge(inputs, target_delta, cov_null=None, preserve_inputs=None, ridge=1e-3, cov_weight=10.0, preserve_weight=50.0, null_dims=None, hard_project=False, rank=None)` "
+    "(0-probe covariance/preserve-constrained ridge delta_W solver), "
     "`batched_head_svdvals(weights, layers=None, proj='W_O', config=None)`, "
     "`head_offset_profile(weights, layer=0, query_pos=6, max_offset=8)`, `rope_rotation_matrix(d_head, offset)`, "
     "`virtual_ov_circuit(weights, layer=0, head=None)`, `mlp_logit_impact(weights, layer=0, tol=1e-4)`, "
@@ -225,6 +229,64 @@ def _read_cgroup_anon_bytes(stat_path: Path) -> int:
     return 0
 
 
+@contextlib.contextmanager
+def _sandbox_linalg_mem_guard(max_factor_bytes: int = 4 * (1024 ** 3)):
+    """Reject unreduced full_matrices=True SVD/QR calls that would allocate >4 GiB square factors."""
+    orig_linalg_svd = torch.linalg.svd
+    orig_torch_svd = torch.svd
+    orig_linalg_qr = torch.linalg.qr
+
+    def _guarded_linalg_svd(A: torch.Tensor, full_matrices: bool = True, *args: Any, **kwargs: Any):
+        if full_matrices and isinstance(A, torch.Tensor) and A.ndim >= 2:
+            batch = max(1, int(A.numel()) // max(1, int(A.shape[-2]) * int(A.shape[-1])))
+            m, n = int(A.shape[-2]), int(A.shape[-1])
+            est_bytes = batch * (m * m + n * n) * max(4, int(A.element_size()))
+            if est_bytes > max_factor_bytes:
+                raise MemoryError(
+                    f"Sandbox memory guard: torch.linalg.svd(..., full_matrices=True) on shape {tuple(A.shape)} "
+                    f"would allocate ~{est_bytes / (1024 ** 3):.1f} GiB; pass full_matrices=False."
+                )
+        return orig_linalg_svd(A, full_matrices, *args, **kwargs)
+
+    def _guarded_torch_svd(input: torch.Tensor, some: bool = True, compute_uv: bool = True, *, out: Any = None):
+        if (not some) and compute_uv and isinstance(input, torch.Tensor) and input.ndim >= 2:
+            batch = max(1, int(input.numel()) // max(1, int(input.shape[-2]) * int(input.shape[-1])))
+            m, n = int(input.shape[-2]), int(input.shape[-1])
+            est_bytes = batch * (m * m + n * n) * max(4, int(input.element_size()))
+            if est_bytes > max_factor_bytes:
+                raise MemoryError(
+                    f"Sandbox memory guard: torch.svd(..., some=False) on shape {tuple(input.shape)} "
+                    f"would allocate ~{est_bytes / (1024 ** 3):.1f} GiB; pass some=True."
+                )
+        if out is not None:
+            return orig_torch_svd(input, some=some, compute_uv=compute_uv, out=out)
+        return orig_torch_svd(input, some=some, compute_uv=compute_uv)
+
+    def _guarded_linalg_qr(A: torch.Tensor, mode: str = "reduced", *, out: Any = None):
+        if mode == "complete" and isinstance(A, torch.Tensor) and A.ndim >= 2:
+            batch = max(1, int(A.numel()) // max(1, int(A.shape[-2]) * int(A.shape[-1])))
+            m = int(A.shape[-2])
+            est_bytes = batch * (m * m) * max(4, int(A.element_size()))
+            if est_bytes > max_factor_bytes:
+                raise MemoryError(
+                    f"Sandbox memory guard: torch.linalg.qr(..., mode='complete') on shape {tuple(A.shape)} "
+                    f"would allocate ~{est_bytes / (1024 ** 3):.1f} GiB; use mode='reduced'."
+                )
+        if out is not None:
+            return orig_linalg_qr(A, mode=mode, out=out)
+        return orig_linalg_qr(A, mode=mode)
+
+    torch.linalg.svd = _guarded_linalg_svd  # type: ignore[assignment]
+    torch.svd = _guarded_torch_svd  # type: ignore[assignment]
+    torch.linalg.qr = _guarded_linalg_qr  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        torch.linalg.svd = orig_linalg_svd  # type: ignore[assignment]
+        torch.svd = orig_torch_svd  # type: ignore[assignment]
+        torch.linalg.qr = orig_linalg_qr  # type: ignore[assignment]
+
+
 class SandboxSession:
     """Stateful multi-turn sandbox (disk-persisted or lightweight in-memory via `from_bundle`)."""
 
@@ -258,9 +320,9 @@ class SandboxSession:
         else:
             orig_w = torch.load(self.pub_dir / "weights.pt", map_location="cpu", weights_only=False)
             extra = {}
-            wb_path = self.pub_dir / "weights_B.pt"
-            if wb_path.exists():
-                extra["weights_B"] = torch.load(wb_path, map_location="cpu", weights_only=False)
+            for pt_path in sorted(self.pub_dir.glob("*.pt")):
+                if pt_path.name not in ("weights.pt", "session_state.pt"):
+                    extra[pt_path.stem] = torch.load(pt_path, map_location="cpu", weights_only=False)
             self.state = {
                 "turn": 0,
                 "forward_budget": int(self.meta["forward_budget"]),
@@ -476,24 +538,29 @@ class SandboxSession:
 
         def _trace_timeout(frame: Any, event: str, arg: Any) -> Any:
             nonlocal trace_ticks
-            if deadline is not None and time.perf_counter() > deadline:
-                raise TimeoutError(f"Sandbox execution exceeded {limit_sec:.2f}s turn timeout.")
-            if cgroup_guard is not None:
-                if (trace_ticks & 63) == 0:
+            if (trace_ticks & 255) == 0:
+                if deadline is not None and time.perf_counter() > deadline:
+                    raise TimeoutError(f"Sandbox execution exceeded {limit_sec:.2f}s turn timeout.")
+                if cgroup_guard is not None:
                     cur_b = _read_cgroup_anon_bytes(cgroup_guard[0])
                     if cur_b > cgroup_guard[1]:
                         raise MemoryError(
                             "Sandbox execution exceeded container RAM safety ceiling (84% of cgroup limit); "
                             "mutate `weights` in-place rather than cloning full state dicts."
                         )
-                trace_ticks += 1
+            trace_ticks += 1
             return _trace_timeout
 
         prev_trace = sys.gettrace()
         t_exec_start = time.perf_counter()
         exec_elapsed_sec = 0.0
         try:
-            with contextlib.redirect_stdout(stdout_buf), contextlib.redirect_stderr(stderr_buf), wsp_tools.bind_sandbox_probe(probe_forward):
+            with (
+                contextlib.redirect_stdout(stdout_buf),
+                contextlib.redirect_stderr(stderr_buf),
+                wsp_tools.bind_sandbox_probe(probe_forward),
+                _sandbox_linalg_mem_guard(),
+            ):
                 compiled = compile(code, "<sandbox>", "exec")
                 try:
                     if need_trace:

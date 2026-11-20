@@ -1,0 +1,203 @@
+{
+  "suite": "synthetic",
+  "synthetic_scale": "mini",
+  "backend": "hybrid_ref",
+  "model_name_or_path": null,
+  "adapter_path": null,
+  "base_seed": 39000,
+  "episodes_per_subtype": 1,
+  "passed": 5,
+  "episodes": 5,
+  "pass_rate": 1.0,
+  "mean_reward": 0.71099,
+  "mean_retained_kl": 0.00499739,
+  "explicit_submit_rate": 1.0,
+  "mean_format_rate": 1.0,
+  "mean_clean_exec_rate": 1.0,
+  "by_model": {
+    "mini": {
+      "passed": 5,
+      "episodes": 5,
+      "pass_rate": 1.0,
+      "mean_reward": 0.71099,
+      "mean_retained_kl": 0.00499739
+    }
+  },
+  "by_subtype": {
+    "organic_cat2_stale_api": {
+      "passed": 1,
+      "episodes": 1,
+      "pass_rate": 1.0,
+      "mean_reward": 0.663603,
+      "mean_retained_kl": 0.00533964
+    },
+    "organic_cat4_api_inject": {
+      "passed": 1,
+      "episodes": 1,
+      "pass_rate": 1.0,
+      "mean_reward": 0.932073,
+      "mean_retained_kl": 0.00198847
+    },
+    "organic_cat5_known_trigger": {
+      "passed": 1,
+      "episodes": 1,
+      "pass_rate": 1.0,
+      "mean_reward": 0.659011,
+      "mean_retained_kl": 0.00603402
+    },
+    "organic_cat5_symptom_only": {
+      "passed": 1,
+      "episodes": 1,
+      "pass_rate": 1.0,
+      "mean_reward": 0.659011,
+      "mean_retained_kl": 0.00603402
+    },
+    "organic_cat6_specialist_merge": {
+      "passed": 1,
+      "episodes": 1,
+      "pass_rate": 1.0,
+      "mean_reward": 0.641253,
+      "mean_retained_kl": 0.00559081
+    }
+  },
+  "results": [
+    {
+      "episode_id": "ep_org_mini_cat5k_39000",
+      "model_key": "mini",
+      "category": "cat5_unlearn_excise",
+      "subtype": "organic_cat5_known_trigger",
+      "seed": 39000,
+      "passed": true,
+      "total_reward": 0.659011,
+      "retained_kl_div": 0.00603402,
+      "stealth_ok": true,
+      "turns_used": 2,
+      "exec_error": false,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "clean_acc": 1.0,
+        "trig_keep_acc": 1.0,
+        "trig_cbad_after": 0.0,
+        "internal_trojan_proj_ratio": 0.123935,
+        "recovery_attack_acc": 0.0,
+        "recovery_attack_cap": 0.25,
+        "retained_kl_div": 0.00603402,
+        "relative_frobenius_edit": 0.012447,
+        "forward_batches_used": 3,
+        "turns_used": 2,
+        "explicit_submit": true
+      }
+    },
+    {
+      "episode_id": "ep_org_mini_cat5s_39000",
+      "model_key": "mini",
+      "category": "cat5_unlearn_excise",
+      "subtype": "organic_cat5_symptom_only",
+      "seed": 39000,
+      "passed": true,
+      "total_reward": 0.659011,
+      "retained_kl_div": 0.00603402,
+      "stealth_ok": true,
+      "turns_used": 2,
+      "exec_error": false,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "clean_acc": 1.0,
+        "trig_keep_acc": 1.0,
+        "trig_cbad_after": 0.0,
+        "internal_trojan_proj_ratio": 0.123935,
+        "recovery_attack_acc": 0.0,
+        "recovery_attack_cap": 0.25,
+        "retained_kl_div": 0.00603402,
+        "relative_frobenius_edit": 0.012447,
+        "forward_batches_used": 3,
+        "turns_used": 2,
+        "explicit_submit": true
+      }
+    },
+    {
+      "episode_id": "ep_org_mini_cat2_39000",
+      "model_key": "mini",
+      "category": "cat2_repair",
+      "subtype": "organic_cat2_stale_api",
+      "seed": 39000,
+      "passed": true,
+      "total_reward": 0.663603,
+      "retained_kl_div": 0.00533964,
+      "stealth_ok": true,
+      "turns_used": 2,
+      "exec_error": false,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "id_acc_before": 0.0,
+        "ood_acc_before": 0.0,
+        "id_acc_after": 1.0,
+        "paraphrase_acc": 1.0,
+        "locality_acc": 1.0,
+        "retained_kl_div": 0.00533964,
+        "relative_frobenius_edit": 0.007198,
+        "forward_batches_used": 3,
+        "turns_used": 2,
+        "explicit_submit": true
+      }
+    },
+    {
+      "episode_id": "ep_org_mini_cat4_39000",
+      "model_key": "mini",
+      "category": "cat4_nullspace_inject",
+      "subtype": "organic_cat4_api_inject",
+      "seed": 39000,
+      "passed": true,
+      "total_reward": 0.932073,
+      "retained_kl_div": 0.00198847,
+      "stealth_ok": true,
+      "turns_used": 2,
+      "exec_error": false,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "target_acc_before": 0.0,
+        "target_acc_after": 0.9583,
+        "paraphrase_acc": 1.0,
+        "locality_acc": 1.0,
+        "retained_kl_div": 0.00198847,
+        "relative_frobenius_edit": 0.008788,
+        "forward_batches_used": 3,
+        "turns_used": 2,
+        "explicit_submit": true
+      }
+    },
+    {
+      "episode_id": "ep_org_mini_cat6_39000",
+      "model_key": "mini",
+      "category": "cat6_splice_merge",
+      "subtype": "organic_cat6_specialist_merge",
+      "seed": 39000,
+      "passed": true,
+      "total_reward": 0.641253,
+      "retained_kl_div": 0.00559081,
+      "stealth_ok": true,
+      "turns_used": 2,
+      "exec_error": false,
+      "explicit_submit": true,
+      "format_rate": 1.0,
+      "clean_exec_rate": 1.0,
+      "metrics": {
+        "task_A_acc": 1.0,
+        "task_B_acc": 0.9583,
+        "retained_kl_div": 0.00559081,
+        "relative_frobenius_edit": 0.008258,
+        "forward_batches_used": 3,
+        "turns_used": 2,
+        "explicit_submit": true
+      }
+    }
+  ]
+}

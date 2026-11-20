@@ -9,7 +9,14 @@ from typing import Any, Callable, Iterable, Iterator
 
 import torch
 
-from wsp_gym.model import LazyTwinWeightDict, ModelConfig, _apply_norm, forward_fast
+from wsp_gym.model import (
+    LazyTwinWeightDict,
+    ModelConfig,
+    _apply_activation,
+    _apply_norm,
+    _apply_rope,
+    forward_fast,
+)
 
 
 _SANDBOX_PROBE_HOOK: contextvars.ContextVar[Callable[..., Any] | None] = contextvars.ContextVar(
@@ -1071,23 +1078,25 @@ def covariance_nullspace(
         norm_key = f"blocks.{layer}.{site}.weight"
 
     with torch.no_grad():
+        feat_dim = d_model
         if isinstance(calib_tokens, torch.Tensor) and calib_tokens.is_floating_point():
             x_mat = calib_tokens.detach().to(dtype=torch.float32, device="cpu")
-            if x_mat.ndim == 3:
-                x_mat = x_mat.reshape(-1, d_model)
-            elif x_mat.ndim == 1:
+            if x_mat.ndim == 1:
                 x_mat = x_mat.unsqueeze(0)
+            feat_dim = int(x_mat.shape[-1])
+            if x_mat.ndim >= 3:
+                x_mat = x_mat.reshape(-1, feat_dim)
             n_rows = max(1, int(x_mat.shape[0]))
             x_dev = (x_mat / math.sqrt(float(n_rows))).to(dev)
-            if n_rows >= 2 * d_model:
+            if n_rows >= 2 * feat_dim:
                 r_mat = torch.linalg.qr(x_dev, mode="r").R
                 _, s_vals_d, vh_d = torch.linalg.svd(r_mat, full_matrices=True)
                 del r_mat
             else:
                 _, s_vals_d, vh_d = torch.linalg.svd(x_dev, full_matrices=True)
             del x_dev
-            eigenvalues_d = torch.zeros(d_model, dtype=torch.float32, device=dev)
-            n_s = min(d_model, int(s_vals_d.numel()))
+            eigenvalues_d = torch.zeros(feat_dim, dtype=torch.float32, device=dev)
+            n_s = min(feat_dim, int(s_vals_d.numel()))
             eigenvalues_d[:n_s] = s_vals_d[:n_s].pow(2)
             del s_vals_d
             sqrt_ev_d = eigenvalues_d.clamp_min(0.0).sqrt()
@@ -1220,43 +1229,498 @@ def covariance_nullspace(
         rank = int((eigenvalues > float(tol_ratio) * max_ev).sum().item())
         v_active = vh_d[:rank].T.detach().cpu().contiguous()
 
-        if rank < d_model:
-            vh_tail_d = vh_d[rank:]
-            ev_tail_d = eigenvalues_d[rank:]
-            tol_ev = max(1e-12, float(tol_ratio) * max_ev)
-            reader_d = _covariance_reader_block(weights, cfg, layer, site).to(dev)
-            proj_d = vh_tail_d @ reader_d
-            rcov_d = proj_d @ proj_d.T
-            rmax = float(rcov_d.diagonal().max().clamp_min(1e-8).item())
-            joint_d = torch.diag(50.0 * (ev_tail_d / tol_ev)) + 0.5 * (rcov_d / rmax)
-            nw_tail_key = norm_key or (
-                "norm_final.weight"
-                if ((layer == "final" or (isinstance(layer, int) and layer < 0)) and "norm_final.weight" in weights)
-                else None
-            )
-            if nw_tail_key is not None and nw_tail_key in weights:
-                nw_t = _epf(nw_tail_key).to(dev).abs()
-                med_nw_t = float(nw_t.median().clamp_min(1e-3).item())
-                short_t = ((1.05 * med_nw_t) / nw_t.clamp_min(0.25 * med_nw_t) - 1.0).clamp(0.0, 3.0).unsqueeze(0)
-                nf_proj_d = vh_tail_d * short_t
-                nf_cov_d = nf_proj_d @ nf_proj_d.T
-                nf_max = float(nf_cov_d.diagonal().max().clamp_min(1e-8).item())
-                joint_d = joint_d + 2.0 * (nf_cov_d / nf_max)
-                del nw_t, short_t, nf_proj_d, nf_cov_d
-            _, evecs_t_d = torch.linalg.eigh(joint_d)
-            v_null = (evecs_t_d.T @ vh_tail_d).T.detach().cpu().contiguous()
-            del vh_tail_d, ev_tail_d, reader_d, proj_d, rcov_d, joint_d, evecs_t_d
+        if rank < feat_dim:
+            if feat_dim == d_model:
+                vh_tail_d = vh_d[rank:]
+                ev_tail_d = eigenvalues_d[rank:]
+                tol_ev = max(1e-12, float(tol_ratio) * max_ev)
+                reader_d = _covariance_reader_block(weights, cfg, layer, site).to(dev)
+                proj_d = vh_tail_d @ reader_d
+                rcov_d = proj_d @ proj_d.T
+                rmax = float(rcov_d.diagonal().max().clamp_min(1e-8).item())
+                joint_d = torch.diag(50.0 * (ev_tail_d / tol_ev)) + 0.5 * (rcov_d / rmax)
+                nw_tail_key = norm_key or (
+                    "norm_final.weight"
+                    if ((layer == "final" or (isinstance(layer, int) and layer < 0)) and "norm_final.weight" in weights)
+                    else None
+                )
+                if nw_tail_key is not None and nw_tail_key in weights:
+                    nw_t = _epf(nw_tail_key).to(dev).abs()
+                    med_nw_t = float(nw_t.median().clamp_min(1e-3).item())
+                    short_t = ((1.05 * med_nw_t) / nw_t.clamp_min(0.25 * med_nw_t) - 1.0).clamp(0.0, 3.0).unsqueeze(0)
+                    nf_proj_d = vh_tail_d * short_t
+                    nf_cov_d = nf_proj_d @ nf_proj_d.T
+                    nf_max = float(nf_cov_d.diagonal().max().clamp_min(1e-8).item())
+                    joint_d = joint_d + 2.0 * (nf_cov_d / nf_max)
+                    del nw_t, short_t, nf_proj_d, nf_cov_d
+                _, evecs_t_d = torch.linalg.eigh(joint_d)
+                v_null = (evecs_t_d.T @ vh_tail_d).T.detach().cpu().contiguous()
+                del vh_tail_d, ev_tail_d, reader_d, proj_d, rcov_d, joint_d, evecs_t_d
+            else:
+                v_null = vh_d[rank:].T.detach().cpu().contiguous()
         else:
-            v_null = torch.zeros((d_model, 0), dtype=torch.float32)
+            v_null = torch.zeros((feat_dim, 0), dtype=torch.float32)
 
         del vh_d, eigenvalues_d
 
     return {
-        "d_model": d_model,
+        "d_model": feat_dim,
         "rank": rank,
-        "null_dim": d_model - rank,
+        "null_dim": feat_dim - rank,
         "eigenvalues": eigenvalues,
         "V_active": v_active,
         "V_null": v_null,
         "sqrt_cov": sqrt_cov,
     }
+
+
+def _to_long_batch(tokens: torch.Tensor | list[list[int]] | list[int]) -> torch.Tensor:
+    t = tokens if isinstance(tokens, torch.Tensor) else torch.as_tensor(tokens, dtype=torch.long)
+    t = t.to(dtype=torch.long, device="cpu")
+    if t.ndim == 1:
+        t = t.unsqueeze(0)
+    if t.ndim != 2 or t.shape[0] == 0 or t.shape[1] == 0:
+        raise ValueError(f"Expected non-empty 1D/2D token tensor, got shape {tuple(t.shape)}.")
+    return t
+
+
+def _resolve_token_targets(
+    spec: int | list[int] | torch.Tensor | None,
+    n_items: int,
+    fallback: torch.Tensor,
+) -> torch.Tensor:
+    if spec is None:
+        return fallback
+    if isinstance(spec, int):
+        return torch.full((n_items,), int(spec), dtype=torch.long)
+    t = spec if isinstance(spec, torch.Tensor) else torch.as_tensor(spec, dtype=torch.long)
+    t = t.reshape(-1).to(dtype=torch.long, device="cpu")
+    if int(t.numel()) == 1:
+        return t.expand(n_items).clone()
+    if int(t.numel()) != n_items:
+        raise ValueError(f"Target/foil token length ({int(t.numel())}) must match batch size ({n_items}).")
+    return t
+
+
+def probe_attribution(
+    weights: dict[str, torch.Tensor],
+    config: dict[str, Any] | ModelConfig,
+    pos_tokens: torch.Tensor | list[list[int]] | list[int],
+    neg_tokens: torch.Tensor | list[list[int]] | list[int] | None = None,
+    target_tokens: int | list[int] | torch.Tensor | None = None,
+    foil_tokens: int | list[int] | torch.Tensor | None = None,
+    layers: Iterable[int] | None = None,
+    top_k: int = 8,
+    pos: int = -1,
+) -> dict[str, Any]:
+    """Contrastive direct logit attribution across layers, GQA heads, and MLP neurons.
+
+    Consumes 1 `probe_forward` batch when `pos_tokens` and `neg_tokens` fit together
+    (`<= 32` rows and equal sequence length), or 1-2 batches otherwise.
+    """
+    cfg = config if isinstance(config, ModelConfig) else ModelConfig.from_dict(config)
+    n_layers = int(cfg.n_layers)
+    d_model = int(cfg.d_model)
+    n_heads = int(cfg.n_heads)
+    n_kv = cfg.effective_kv_heads()
+    d_head = int(cfg.d_head)
+    gs = max(1, n_heads // max(1, n_kv))
+    is_lazy = isinstance(weights, LazyTwinWeightDict)
+    k_top = max(1, int(top_k))
+
+    def _epf(k: str) -> torch.Tensor:
+        return weights.get_ephemeral_f32(k) if is_lazy else weights[k].detach().to(dtype=torch.float32, device="cpu")
+
+    def _raw(k: str) -> torch.Tensor:
+        return weights.raw_tensor(k) if is_lazy else weights[k]
+
+    pos_t = _to_long_batch(pos_tokens)
+    neg_t = _to_long_batch(neg_tokens) if neg_tokens is not None else None
+    layer_ids = list(range(n_layers)) if layers is None else [int(l) for l in layers]
+    if any(l < 0 or l >= n_layers for l in layer_ids):
+        raise ValueError(f"Layer index out of range [0, {n_layers}) in {layer_ids}.")
+
+    cache_keys: set[str] = {"resid_final"}
+    if n_layers > 0:
+        cache_keys.add(f"blocks.{n_layers - 1}.resid_post")
+    for l in layer_ids:
+        cache_keys.add("resid_pre_0" if l == 0 else f"blocks.{l - 1}.resid_post")
+        cache_keys.update(
+            {
+                f"blocks.{l}.attn.out",
+                f"blocks.{l}.resid_mid",
+                f"blocks.{l}.mlp.out",
+                f"blocks.{l}.resid_post",
+            }
+        )
+
+    hook = _SANDBOX_PROBE_HOOK.get()
+
+    def _run_fwd(toks: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if hook is not None:
+            try:
+                return hook(toks, None, return_cache=True, cache_keys=cache_keys)
+            except TypeError:
+                return hook(toks, None, True)
+        return forward_fast(toks, weights, cfg, return_cache=True, cache_keys=cache_keys)
+
+    with torch.no_grad():
+        n_pos = int(pos_t.shape[0])
+        if neg_t is not None and pos_t.shape[1] == neg_t.shape[1] and (n_pos + int(neg_t.shape[0])) <= 32:
+            both_logits, both_cache = _run_fwd(torch.cat([pos_t, neg_t], dim=0))
+            pos_logits = both_logits[:n_pos].float().cpu()
+            neg_logits: torch.Tensor | None = both_logits[n_pos:].float().cpu()
+            pos_cache = {k: v[:n_pos].detach().float().cpu() for k, v in both_cache.items()}
+            neg_cache: dict[str, torch.Tensor] | None = {
+                k: v[n_pos:].detach().float().cpu() for k, v in both_cache.items()
+            }
+            del both_logits, both_cache
+        else:
+            p_log, p_c = _run_fwd(pos_t)
+            pos_logits = p_log.float().cpu()
+            pos_cache = {k: v.detach().float().cpu() for k, v in p_c.items()}
+            del p_log, p_c
+            if neg_t is not None:
+                n_log, n_c = _run_fwd(neg_t)
+                neg_logits = n_log.float().cpu()
+                neg_cache = {k: v.detach().float().cpu() for k, v in n_c.items()}
+                del n_log, n_c
+            else:
+                neg_logits = None
+                neg_cache = None
+
+        pos_last = pos_logits[:, pos, :]
+        pos_top2 = torch.topk(pos_last, k=min(2, int(pos_last.shape[-1])), dim=-1).indices
+        pos_top1 = pos_top2[:, 0]
+        tgt_idx = _resolve_token_targets(target_tokens, n_pos, pos_top1)
+
+        if neg_logits is not None:
+            neg_last = neg_logits[:, pos, :]
+            neg_top1 = neg_last.argmax(dim=-1)
+            if foil_tokens is not None:
+                foil_idx = _resolve_token_targets(foil_tokens, n_pos, neg_top1)
+            else:
+                neg_mode = int(torch.mode(neg_top1).values.item())
+                base_foil = neg_top1 if int(neg_top1.shape[0]) == n_pos else torch.full((n_pos,), neg_mode, dtype=torch.long)
+                alt_pos = pos_top2[:, 1] if int(pos_top2.shape[1]) > 1 else pos_top1
+                foil_idx = torch.where(base_foil != tgt_idx, base_foil, alt_pos)
+        else:
+            neg_top1 = None
+            alt_pos = pos_top2[:, 1] if int(pos_top2.shape[1]) > 1 else pos_top1
+            fallback_foil = torch.where(pos_top1 != tgt_idx, pos_top1, alt_pos)
+            foil_idx = _resolve_token_targets(foil_tokens, n_pos, fallback_foil)
+
+        row_ar = torch.arange(n_pos, dtype=torch.long)
+        pos_ld = (pos_last[row_ar, tgt_idx] - pos_last[row_ar, foil_idx]).mean()
+        if neg_logits is not None:
+            neg_last_cmp = neg_logits[:, pos, :]
+            if int(neg_last_cmp.shape[0]) == n_pos:
+                neg_ld = (neg_last_cmp[row_ar, tgt_idx] - neg_last_cmp[row_ar, foil_idx]).mean()
+            else:
+                t_mode = int(torch.mode(tgt_idx).values.item())
+                f_mode = int(torch.mode(foil_idx).values.item())
+                neg_ld = (neg_last_cmp[:, t_mode] - neg_last_cmp[:, f_mode]).mean()
+            mean_logit_diff = float((pos_ld - neg_ld).item())
+        else:
+            mean_logit_diff = float(pos_ld.item())
+
+        raw_wu = _raw("W_U")
+        wu_diff = (raw_wu[:, tgt_idx] - raw_wu[:, foil_idx]).to(dtype=torch.float32, device="cpu")  # (d_model, n_pos)
+        nf = _epf("norm_final.weight") if (cfg.norm_type != "none" and "norm_final.weight" in weights) else None
+        if nf is not None:
+            wu_diff = wu_diff * nf.unsqueeze(1)
+        if n_layers > 0:
+            x_pre_final = pos_cache[f"blocks.{n_layers - 1}.resid_post"][:, pos, :]
+            if cfg.norm_type == "rmsnorm":
+                inv_rms = torch.rsqrt(x_pre_final.pow(2).mean(dim=-1, keepdim=True) + cfg.rms_eps).squeeze(-1)
+            elif cfg.norm_type == "layernorm":
+                inv_rms = torch.rsqrt(x_pre_final.var(dim=-1, unbiased=False, keepdim=True) + cfg.rms_eps).squeeze(-1)
+            else:
+                inv_rms = torch.ones(n_pos, dtype=torch.float32)
+            wu_diff = wu_diff * inv_rms.unsqueeze(0)
+        logit_dir = wu_diff.mean(dim=1)
+        metric_dir = logit_dir / logit_dir.norm().clamp_min(1e-8)
+
+        layer_scores: list[dict[str, Any]] = []
+        for l in layer_ids:
+            da = pos_cache[f"blocks.{l}.attn.out"][:, pos, :].mean(dim=0)
+            dm = pos_cache[f"blocks.{l}.mlp.out"][:, pos, :].mean(dim=0)
+            dr = pos_cache[f"blocks.{l}.resid_post"][:, pos, :].mean(dim=0)
+            if neg_cache is not None:
+                da = da - neg_cache[f"blocks.{l}.attn.out"][:, pos, :].mean(dim=0)
+                dm = dm - neg_cache[f"blocks.{l}.mlp.out"][:, pos, :].mean(dim=0)
+                dr = dr - neg_cache[f"blocks.{l}.resid_post"][:, pos, :].mean(dim=0)
+            a_dla = float((da @ logit_dir).item())
+            m_dla = float((dm @ logit_dir).item())
+            layer_scores.append(
+                {
+                    "layer": l,
+                    "attn_dla": round(a_dla, 6),
+                    "mlp_dla": round(m_dla, 6),
+                    "total_dla": round(a_dla + m_dla, 6),
+                    "attn_diff_norm": round(float(da.norm().item()), 6),
+                    "mlp_diff_norm": round(float(dm.norm().item()), 6),
+                    "resid_diff_norm": round(float(dr.norm().item()), 6),
+                }
+            )
+
+        if len(layer_ids) <= 10:
+            cand_layers = list(layer_ids)
+        else:
+            by_a = [r["layer"] for r in sorted(layer_scores, key=lambda r: abs(r["attn_dla"]), reverse=True)[:8]]
+            by_m = [r["layer"] for r in sorted(layer_scores, key=lambda r: abs(r["mlp_dla"]), reverse=True)[:8]]
+            by_dn = [
+                r["layer"]
+                for r in sorted(
+                    layer_scores,
+                    key=lambda r: max(r["attn_diff_norm"], r["mlp_diff_norm"]),
+                    reverse=True,
+                )[:3]
+            ]
+            cand_layers = sorted(set(by_a) | set(by_m) | set(by_dn))
+
+        scale = 1.0 / math.sqrt(max(1, d_head))
+
+        def _head_outs(x_pre: torch.Tensor, l_idx: int) -> torch.Tensor:
+            bsz, seq_len, _ = x_pre.shape
+            p_idx = pos if pos >= 0 else seq_len + pos
+            p_idx = max(0, min(seq_len - 1, p_idx))
+            pref = f"blocks.{l_idx}"
+            n1 = _epf(f"{pref}.norm1.weight") if (cfg.norm_type != "none" and f"{pref}.norm1.weight" in weights) else None
+            xn = _apply_norm(x_pre, cfg.norm_type, n1, cfg.rms_eps)
+            wq = _epf(f"{pref}.attn.W_Q")
+            wk = _epf(f"{pref}.attn.W_K")
+            wv = _epf(f"{pref}.attn.W_V")
+            wo = _epf(f"{pref}.attn.W_O")
+            q = (xn @ wq.permute(1, 0, 2).reshape(d_model, n_heads * d_head)).view(
+                bsz, seq_len, n_heads, d_head
+            ).transpose(1, 2)
+            k = (xn @ wk.permute(1, 0, 2).reshape(d_model, n_kv * d_head)).view(
+                bsz, seq_len, n_kv, d_head
+            ).transpose(1, 2)
+            v = (xn @ wv.permute(1, 0, 2).reshape(d_model, n_kv * d_head)).view(
+                bsz, seq_len, n_kv, d_head
+            ).transpose(1, 2)
+            if f"{pref}.attn.b_Q" in weights:
+                q = q + _epf(f"{pref}.attn.b_Q").view(1, n_heads, 1, d_head)
+            if f"{pref}.attn.b_K" in weights:
+                k = k + _epf(f"{pref}.attn.b_K").view(1, n_kv, 1, d_head)
+            if f"{pref}.attn.b_V" in weights:
+                v = v + _epf(f"{pref}.attn.b_V").view(1, n_kv, 1, d_head)
+            if cfg.pos_type == "rope":
+                q, k = _apply_rope(q, k, rope_theta=cfg.rope_theta)
+            if n_kv < n_heads:
+                k_exp = k.repeat_interleave(gs, dim=1)
+                v_exp = v.repeat_interleave(gs, dim=1)
+            else:
+                k_exp, v_exp = k, v
+            q_p = q[:, :, p_idx : p_idx + 1, :]
+            scores = torch.matmul(q_p, k_exp.transpose(-2, -1)) * scale
+            if cfg.causal and p_idx + 1 < seq_len:
+                scores[:, :, :, p_idx + 1 :] = -1e9
+            pat = torch.softmax(scores, dim=-1)
+            ctx_h = torch.matmul(pat, v_exp).squeeze(2)  # (bsz, n_heads, d_head)
+            return torch.einsum("bhd,hdm->bhm", ctx_h, wo)
+
+        def _mlp_hidden(r_mid: torch.Tensor, l_idx: int) -> torch.Tensor:
+            pref = f"blocks.{l_idx}"
+            n2 = _epf(f"{pref}.norm2.weight") if (cfg.norm_type != "none" and f"{pref}.norm2.weight" in weights) else None
+            xn2 = _apply_norm(r_mid, cfg.norm_type, n2, cfg.rms_eps)
+            pre_act = xn2 @ _epf(f"{pref}.mlp.W_in") + _epf(f"{pref}.mlp.b_in")
+            if cfg.mlp_type == "swiglu":
+                gate = torch.nn.functional.silu(xn2 @ _epf(f"{pref}.mlp.W_gate"))
+                return gate * pre_act
+            return _apply_activation(pre_act, cfg.act_type)
+
+        all_heads: list[dict[str, Any]] = []
+        all_neurons: list[dict[str, Any]] = []
+        for l in cand_layers:
+            pre_k = "resid_pre_0" if l == 0 else f"blocks.{l - 1}.resid_post"
+            h_pos = _head_outs(pos_cache[pre_k], l).mean(dim=0)
+            dh = h_pos - (_head_outs(neg_cache[pre_k], l).mean(dim=0) if neg_cache is not None else 0.0)
+            h_dlas = dh @ logit_dir
+            h_norms = dh.norm(dim=-1)
+            for h in range(n_heads):
+                all_heads.append(
+                    {
+                        "layer": l,
+                        "head": h,
+                        "kv_head": h // gs,
+                        "dla": round(float(h_dlas[h].item()), 6),
+                        "out_diff_norm": round(float(h_norms[h].item()), 6),
+                    }
+                )
+
+            act_pos = _mlp_hidden(pos_cache[f"blocks.{l}.resid_mid"][:, pos, :], l).mean(dim=0)
+            act_diff = act_pos - (
+                _mlp_hidden(neg_cache[f"blocks.{l}.resid_mid"][:, pos, :], l).mean(dim=0)
+                if neg_cache is not None
+                else 0.0
+            )
+            w_out = _epf(f"blocks.{l}.mlp.W_out")
+            n_dlas = act_diff * (w_out @ logit_dir)
+            top_n_vals, top_n_idx = torch.topk(n_dlas.abs(), k=min(k_top, int(n_dlas.numel())))
+            del top_n_vals
+            for j_t in top_n_idx.tolist():
+                all_neurons.append(
+                    {
+                        "layer": l,
+                        "neuron": int(j_t),
+                        "dla": round(float(n_dlas[j_t].item()), 6),
+                        "act_diff": round(float(act_diff[j_t].item()), 6),
+                    }
+                )
+
+        top_layers = sorted(layer_scores, key=lambda r: abs(r["total_dla"]), reverse=True)[:k_top]
+        top_heads = sorted(all_heads, key=lambda r: abs(r["dla"]), reverse=True)[:k_top]
+        top_neurons = sorted(all_neurons, key=lambda r: abs(r["dla"]), reverse=True)[:k_top]
+
+    return {
+        "pos_top1": pos_top1.tolist(),
+        "neg_top1": neg_top1.tolist() if neg_top1 is not None else None,
+        "mean_logit_diff": round(mean_logit_diff, 6),
+        "metric_dir": metric_dir.detach().cpu(),
+        "logit_dir": logit_dir.detach().cpu(),
+        "layer_scores": layer_scores,
+        "top_layers": top_layers,
+        "top_heads": top_heads,
+        "top_neurons": top_neurons,
+    }
+
+
+def _extract_cov_projection_basis(
+    cov_null: dict[str, Any] | torch.Tensor,
+    d_in: int,
+    null_dims: int | None,
+) -> torch.Tensor:
+    if isinstance(cov_null, dict):
+        vn = cov_null["V_null"].detach().to(dtype=torch.float32, device="cpu")
+        if null_dims is None:
+            return vn
+        k_want = max(1, min(d_in, int(null_dims)))
+        if int(vn.shape[1]) >= k_want:
+            return vn[:, :k_want]
+        va = cov_null.get("V_active")
+        if va is not None and int(va.shape[1]) > 0:
+            need = k_want - int(vn.shape[1])
+            va_cpu = va.detach().to(dtype=torch.float32, device="cpu")
+            extra = va_cpu[:, max(0, int(va_cpu.shape[1]) - need) :].flip(1)
+            return torch.cat([vn, extra], dim=1)
+        return vn
+    p_mat = cov_null.detach().to(dtype=torch.float32, device="cpu")
+    if null_dims is not None:
+        return p_mat[:, : int(null_dims)]
+    return p_mat
+
+
+def solve_nullspace_ridge(
+    inputs: torch.Tensor,
+    target_delta: torch.Tensor,
+    cov_null: dict[str, Any] | torch.Tensor | None = None,
+    preserve_inputs: torch.Tensor | None = None,
+    ridge: float = 1e-3,
+    cov_weight: float = 10.0,
+    preserve_weight: float = 50.0,
+    null_dims: int | None = None,
+    hard_project: bool = False,
+    rank: int | None = None,
+) -> torch.Tensor:
+    """Solve a constrained linear/ridge update minimizing collateral drift on clean covariance."""
+    x_raw = inputs.detach().cpu().to(dtype=torch.float64)
+    x = x_raw.unsqueeze(0) if x_raw.ndim == 1 else x_raw.reshape(-1, int(x_raw.shape[-1]))
+    n_samp, d_in = int(x.shape[0]), int(x.shape[1])
+
+    y_raw = target_delta.detach().cpu().to(dtype=torch.float64)
+    squeeze_out = y_raw.ndim == 1 or (x_raw.ndim >= 2 and y_raw.ndim == x_raw.ndim - 1)
+    y = y_raw.reshape(n_samp, -1) if squeeze_out else y_raw.reshape(-1, int(y_raw.shape[-1]))
+    if int(y.shape[0]) != n_samp:
+        raise ValueError(f"inputs rows ({n_samp}) != target_delta rows ({int(y.shape[0])}).")
+    d_out = int(y.shape[1])
+
+    x_keep: torch.Tensor | None = None
+    m_keep = 0
+    if preserve_inputs is not None:
+        xk_raw = preserve_inputs.detach().cpu().to(dtype=torch.float64)
+        if xk_raw.numel() > 0:
+            x_keep = xk_raw.unsqueeze(0) if xk_raw.ndim == 1 else xk_raw.reshape(-1, d_in)
+            m_keep = int(x_keep.shape[0])
+
+    eig_scale = max(1.0, float((x.pow(2).sum(dim=-1).mean() / max(1, n_samp)).item()))
+    eff_ridge = max(1e-8, float(ridge) * eig_scale)
+
+    with torch.no_grad():
+        if hard_project and cov_null is not None:
+            p_mat = _extract_cov_projection_basis(cov_null, d_in, null_dims).to(dtype=torch.float64)
+            if int(p_mat.shape[1]) == 0:
+                delta_w = torch.zeros((d_in, d_out), dtype=torch.float32)
+            else:
+                z = x @ p_mat
+                k_dim = int(p_mat.shape[1])
+                gram = (z.T @ z) / max(1, n_samp) + float(eff_ridge) * torch.eye(k_dim, dtype=torch.float64)
+                if x_keep is not None and m_keep > 0 and preserve_weight > 0:
+                    zk = x_keep @ p_mat
+                    gram = gram + (float(preserve_weight) / float(m_keep)) * (zk.T @ zk)
+                rhs = (z.T @ y) / max(1, n_samp)
+                try:
+                    sol = torch.linalg.solve(gram, rhs)
+                except RuntimeError:
+                    sol = torch.linalg.lstsq(gram, rhs).solution
+                delta_w = (p_mat @ sol).detach().cpu().to(dtype=torch.float32)
+        elif cov_null is None and (n_samp + m_keep) < d_in:
+            # Dual/Woodbury formulation avoids forming d_in x d_in matrices for wide MLP layers.
+            wx = 1.0 / math.sqrt(float(max(1, n_samp)))
+            x_tilde = x * wx
+            y_tilde = y * wx
+            if x_keep is not None and m_keep > 0 and preserve_weight > 0:
+                wk = math.sqrt(float(preserve_weight) / float(m_keep))
+                x_tilde = torch.cat([x_tilde, x_keep * wk], dim=0)
+                y_tilde = torch.cat([y_tilde, torch.zeros((m_keep, d_out), dtype=torch.float64)], dim=0)
+            m_dual = int(x_tilde.shape[0])
+            dual_gram = x_tilde @ x_tilde.T + float(eff_ridge) * torch.eye(m_dual, dtype=torch.float64)
+            try:
+                alpha = torch.linalg.solve(dual_gram, y_tilde)
+            except RuntimeError:
+                alpha = torch.linalg.lstsq(dual_gram, y_tilde).solution
+            delta_w = (x_tilde.T @ alpha).detach().cpu().to(dtype=torch.float32)
+        else:
+            use_cuda = torch.cuda.is_available() and d_in >= 512
+            dev = torch.device("cuda") if use_cuda else torch.device("cpu")
+            xd = x.to(dev)
+            yd = y.to(dev)
+            gram = (xd.T @ xd) / max(1, n_samp) + float(eff_ridge) * torch.eye(d_in, dtype=torch.float64, device=dev)
+            if cov_null is not None and cov_weight > 0:
+                if isinstance(cov_null, dict):
+                    if "sqrt_cov" in cov_null:
+                        sc = cov_null["sqrt_cov"].detach().to(device=dev, dtype=torch.float64)
+                        c_clean = sc.T @ sc
+                        del sc
+                    elif "V_active" in cov_null and "eigenvalues" in cov_null:
+                        va = cov_null["V_active"].detach().to(device=dev, dtype=torch.float64)
+                        evs = cov_null["eigenvalues"][: va.shape[1]].detach().to(device=dev, dtype=torch.float64)
+                        c_clean = (va * evs.unsqueeze(0)) @ va.T
+                        del va, evs
+                    else:
+                        c_clean = torch.zeros((d_in, d_in), dtype=torch.float64, device=dev)
+                else:
+                    sc = cov_null.detach().to(device=dev, dtype=torch.float64)
+                    c_clean = sc.T @ sc
+                    del sc
+                gram = gram + float(cov_weight) * c_clean
+                del c_clean
+            if x_keep is not None and m_keep > 0 and preserve_weight > 0:
+                xkd = x_keep.to(dev)
+                gram = gram + (float(preserve_weight) / float(m_keep)) * (xkd.T @ xkd)
+                del xkd
+            rhs = (xd.T @ yd) / max(1, n_samp)
+            try:
+                delta_w = torch.linalg.solve(gram, rhs).detach().cpu().to(dtype=torch.float32)
+            except RuntimeError:
+                delta_w = torch.linalg.lstsq(gram, rhs).solution.detach().cpu().to(dtype=torch.float32)
+            del xd, yd, gram, rhs
+
+        if rank is not None and 0 < int(rank) < min(d_in, d_out):
+            u, s, vh = torch.linalg.svd(delta_w, full_matrices=False)
+            r = int(rank)
+            delta_w = (u[:, :r] * s[:r].unsqueeze(0)) @ vh[:r, :]
+
+    return delta_w.squeeze(-1) if squeeze_out else delta_w
